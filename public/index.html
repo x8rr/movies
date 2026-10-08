@@ -242,6 +242,40 @@ function closeDetail() {
   document.getElementById('detailOverlay').classList.remove('active');
 }
 
+function playStream(stream, video, status) {
+  if (stream.type === 'hls') {
+    const url = stream.playlist;
+    if (Hls.isSupported()) {
+      const hls = new Hls();
+      hls.loadSource(url);
+      hls.attachMedia(video);
+      hls.on(Hls.Events.MANIFEST_PARSED, () => { video.play(); status.textContent = ''; });
+      hls.on(Hls.Events.ERROR, (_e, data) => {
+        if (data.fatal) status.textContent = 'stream error';
+      });
+      video._hls = hls;
+    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+      video.src = url;
+      video.play();
+      status.textContent = '';
+    }
+    return true;
+  }
+  if (stream.type === 'file') {
+    const qualities = stream.qualities;
+    const best = qualities
+      ? Object.values(qualities).sort((a, b) => (b.quality || 0) - (a.quality || 0))[0]
+      : null;
+    if (best?.url) {
+      video.src = best.url;
+      video.play();
+      status.textContent = '';
+      return true;
+    }
+  }
+  return false;
+}
+
 async function scrapeAndPlay(id, type, title, season, episode) {
   const overlay = document.getElementById('playerOverlay');
   const video = document.getElementById('videoPlayer');
@@ -253,48 +287,18 @@ async function scrapeAndPlay(id, type, title, season, episode) {
   status.textContent = 'finding sources...';
   video.src = '';
 
+  const path = type === 'movie' ? `/api/scrape/movie/${id}` : `/api/scrape/tv/${id}/${season}/${episode}`;
+
   try {
-    const path = type === 'movie'
-      ? `/api/scrape/movie/${id}`
-      : `/api/scrape/tv/${id}/${season}/${episode}`;
+    const r = await fetch(API + path);
+    const data = await r.json();
 
-    const result = await api(path);
-    status.textContent = 'loading stream...';
-
-    const stream = result.stream;
-    if (!stream) { status.textContent = 'no playable stream found'; return; }
-
-    if (stream.type === 'hls') {
-      const url = stream.playlist;
-      if (Hls.isSupported()) {
-        const hls = new Hls();
-        hls.loadSource(url);
-        hls.attachMedia(video);
-        hls.on(Hls.Events.MANIFEST_PARSED, () => { video.play(); status.textContent = ''; });
-        hls.on(Hls.Events.ERROR, (_e, data) => {
-          if (data.fatal) status.textContent = 'stream error';
-        });
-        video._hls = hls;
-      } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-        video.src = url;
-        video.play();
-        status.textContent = '';
-      }
-    } else if (stream.type === 'file') {
-      const qualities = stream.qualities;
-      const best = qualities
-        ? Object.values(qualities).sort((a, b) => (b.quality || 0) - (a.quality || 0))[0]
-        : null;
-      if (best?.url) {
-        video.src = best.url;
-        video.play();
-        status.textContent = '';
-      } else {
-        status.textContent = 'no playable file found';
-      }
-    } else {
-      status.textContent = `unsupported stream type: ${stream.type}`;
+    if (r.ok && data.stream) {
+      status.textContent = 'loading stream...';
+      if (playStream(data.stream, video, status)) return;
     }
+
+    status.textContent = 'no sources available for this title';
   } catch (e) {
     status.textContent = 'error: ' + e.message;
   }
