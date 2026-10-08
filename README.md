@@ -1,43 +1,79 @@
 # movies
 
-lightweight self-hosted movie api. proxies TMDB for search, discover, movie/tv details, seasons, episodes, genres, and person info.
+lightweight self-hosted pstream-compatible backend. syncs bookmarks, watch progress, history, groups, and settings. uses SQLite instead of PostgreSQL so there's nothing extra to set up.
+
+point the pstream frontend at your instance URL and it works.
 
 ## setup
 
-get a TMDB API key from https://www.themoviedb.org/settings/api
-
 ```
 cp .env.example .env
-# add your TMDB_API_KEY to .env
+```
+
+generate a secret and add it to `.env`:
+```
+openssl rand -hex 32
 ```
 
 ### run directly
 
 ```
 npm install
-TMDB_API_KEY=your-key npm start
+npm start
 ```
 
 ### docker
 
 ```
-TMDB_API_KEY=your-key docker compose up -d
+docker compose up -d
 ```
 
-runs on port 8080 by default.
+runs on port 3000 by default. data is stored in `./data/movies.db`.
 
 ## endpoints
 
-- `GET /search/movie?query=` - search movies
-- `GET /search/tv?query=` - search tv shows
-- `GET /search/multi?query=` - search all
-- `GET /trending/:type/:window` - trending (movie/tv/all, day/week)
-- `GET /discover/movie` - discover movies
-- `GET /discover/tv` - discover tv
-- `GET /movie/:id` - movie details (includes credits, videos, recommendations)
-- `GET /tv/:id` - tv show details
-- `GET /tv/:id/season/:num` - season details
-- `GET /tv/:id/season/:num/episode/:num` - episode details
-- `GET /genre/movie/list` - movie genres
-- `GET /genre/tv/list` - tv genres
-- `GET /person/:id` - person details + credits
+**meta**
+- `GET /` - version info
+- `GET /meta` - server metadata
+- `GET /health` - database health check
+
+**auth** (ed25519 challenge-response, same as pstream)
+- `POST /auth/register/start` - get registration challenge
+- `POST /auth/register/complete` - complete registration
+- `POST /auth/login/start` - get login challenge
+- `POST /auth/login/complete` - complete login
+
+**users** (all authenticated)
+- `GET /users/@me` - current user + session
+- `PATCH /users/:id` - update profile
+- `DELETE /users/:id` - delete account
+
+**bookmarks**
+- `GET /users/:id/bookmarks`
+- `PUT /users/:id/bookmarks` - bulk upsert
+- `POST /users/:id/bookmarks/:tmdbid` - single upsert
+- `DELETE /users/:id/bookmarks/:tmdbid`
+
+**progress**
+- `GET /users/:id/progress`
+- `PUT /users/:id/progress/:tmdbid`
+- `PUT /users/:id/progress/import` - bulk import
+- `DELETE /users/:id/progress/:tmdbid`
+
+**watch history**
+- `GET /users/:id/watch-history`
+- `PUT /users/:id/watch-history/:tmdbid`
+- `DELETE /users/:id/watch-history/:tmdbid`
+
+**settings**
+- `GET /users/:id/settings`
+- `PUT /users/:id/settings`
+
+**sessions**
+- `GET /users/:id/sessions`
+- `PATCH /sessions/:sid` - rename device
+- `DELETE /sessions/:sid` - revoke session
+
+**groups**
+- `GET /users/:id/group-order`
+- `PUT /users/:id/group-order`

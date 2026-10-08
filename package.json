@@ -1,7 +1,7 @@
 {
   "name": "movies-api",
   "version": "1.0.0",
-  "description": "Lightweight self-hosted movie streaming API",
+  "description": "Lightweight self-hosted pstream-compatible backend",
   "type": "module",
   "main": "src/index.js",
   "scripts": {
@@ -9,7 +9,12 @@
     "dev": "node --watch src/index.js"
   },
   "dependencies": {
+    "better-sqlite3": "^11.8.1",
     "cors": "^2.8.5",
-    "express": "^5.1.0"
+    "express": "^5.1.0",
+    "jsonwebtoken": "^9.0.2",
+    "tweetnacl": "^1.0.3",
+    "tweetnacl-util": "^0.15.1",
+    "uuid": "^11.1.0"
   }
 }
