@@ -1,5 +1,7 @@
 import express from "express";
 import cors from "cors";
+import { fileURLToPath } from "url";
+import { dirname, join } from "path";
 import { db } from "./db.js";
 import authRoutes from "./routes/authRoutes.js";
 import userRoutes from "./routes/users.js";
@@ -9,10 +11,14 @@ import historyRoutes from "./routes/history.js";
 import settingsRoutes from "./routes/settings.js";
 import sessionRoutes from "./routes/sessions.js";
 import groupRoutes from "./routes/groups.js";
+import streamRoutes from "./routes/stream.js";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
 
 const app = express();
 app.use(cors());
 app.use(express.json());
+app.use(express.static(join(__dirname, "..", "public")));
 
 const PORT = process.env.PORT || 3000;
 const HOST = process.env.HOST || "0.0.0.0";
@@ -51,6 +57,7 @@ app.use("/users/:id/settings", settingsRoutes);
 app.use("/users/:id/sessions", sessionRoutes);
 app.use("/users/:id/group-order", groupRoutes);
 app.use("/sessions", sessionRoutes);
+app.use("/api", streamRoutes);
 
 app.listen(PORT, HOST, () => {
   console.log(`movies-api listening on ${HOST}:${PORT}`);

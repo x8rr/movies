@@ -1,8 +1,8 @@
 # movies
 
-lightweight self-hosted pstream-compatible backend. syncs bookmarks, watch progress, history, groups, and settings. uses SQLite instead of PostgreSQL so there's nothing extra to set up.
+lightweight self-hosted movie streaming API with pstream-compatible sync backend. scrapes streaming sources via [@p-stream/providers](https://github.com/movie-web-rip/pstream-providers), proxies TMDB for metadata, and includes a basic web UI for searching and playing.
 
-point the pstream frontend at your instance URL and it works.
+uses bun + SQLite, nothing else to set up.
 
 ## setup
 
@@ -15,11 +15,13 @@ generate a secret and add it to `.env`:
 openssl rand -hex 32
 ```
 
+get a TMDB API key from https://www.themoviedb.org/settings/api and add it to `.env`.
+
 ### run directly
 
 ```
-npm install
-npm start
+bun install
+bun start
 ```
 
 ### docker
@@ -30,50 +32,34 @@ docker compose up -d
 
 runs on port 3000 by default. data is stored in `./data/movies.db`.
 
-## endpoints
+## streaming
 
-**meta**
-- `GET /` - version info
-- `GET /meta` - server metadata
-- `GET /health` - database health check
+- `GET /api/sources` - list available scraping providers
+- `GET /api/scrape/movie/:tmdbId` - scrape movie sources
+- `GET /api/scrape/tv/:tmdbId/:season/:episode` - scrape TV episode sources
+- `GET /api/search/:type?query=` - search TMDB (movie, tv, multi)
+- `GET /api/trending/:type/:window` - trending (all/movie/tv, day/week)
+- `GET /api/movie/:id` - movie details
+- `GET /api/tv/:id` - TV show details
+- `GET /api/tv/:id/season/:season` - season episodes
 
-**auth** (ed25519 challenge-response, same as pstream)
-- `POST /auth/register/start` - get registration challenge
-- `POST /auth/register/complete` - complete registration
-- `POST /auth/login/start` - get login challenge
-- `POST /auth/login/complete` - complete login
+## sync (pstream-compatible)
 
-**users** (all authenticated)
-- `GET /users/@me` - current user + session
-- `PATCH /users/:id` - update profile
-- `DELETE /users/:id` - delete account
+point the pstream frontend at your instance URL and it works.
 
-**bookmarks**
-- `GET /users/:id/bookmarks`
-- `PUT /users/:id/bookmarks` - bulk upsert
-- `POST /users/:id/bookmarks/:tmdbid` - single upsert
-- `DELETE /users/:id/bookmarks/:tmdbid`
+**auth** (ed25519 challenge-response)
+- `POST /auth/register/start` + `/auth/register/complete`
+- `POST /auth/login/start` + `/auth/login/complete`
 
-**progress**
-- `GET /users/:id/progress`
-- `PUT /users/:id/progress/:tmdbid`
-- `PUT /users/:id/progress/import` - bulk import
-- `DELETE /users/:id/progress/:tmdbid`
+**users** (authenticated)
+- `GET /users/@me`, `PATCH /users/:id`, `DELETE /users/:id`
 
-**watch history**
-- `GET /users/:id/watch-history`
-- `PUT /users/:id/watch-history/:tmdbid`
-- `DELETE /users/:id/watch-history/:tmdbid`
+**bookmarks** - `GET/PUT/POST/DELETE /users/:id/bookmarks`
 
-**settings**
-- `GET /users/:id/settings`
-- `PUT /users/:id/settings`
+**progress** - `GET/PUT/DELETE /users/:id/progress/:tmdbid`
 
-**sessions**
-- `GET /users/:id/sessions`
-- `PATCH /sessions/:sid` - rename device
-- `DELETE /sessions/:sid` - revoke session
+**watch history** - `GET/PUT/DELETE /users/:id/watch-history/:tmdbid`
 
-**groups**
-- `GET /users/:id/group-order`
-- `PUT /users/:id/group-order`
+**settings** - `GET/PUT /users/:id/settings`
+
+**sessions** - `GET /users/:id/sessions`, `PATCH/DELETE /sessions/:sid`
