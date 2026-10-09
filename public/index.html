@@ -42,14 +42,29 @@
     }
     .player-overlay.active { display: flex; }
     .player-bar {
-      padding: 12px 20px; display: flex; align-items: center; gap: 12px;
-      background: #111; border-bottom: 1px solid #222;
+      padding: 8px 20px; display: flex; align-items: center; gap: 12px;
+      background: #111; border-bottom: 1px solid #222; flex-shrink: 0;
     }
     .player-bar .back { cursor: pointer; color: #888; font-size: 20px; }
     .player-bar .back:hover { color: #fff; }
     .player-bar .now-playing { font-size: 14px; color: #ccc; }
     .player-bar .status { margin-left: auto; font-size: 12px; color: #666; }
-    video { flex: 1; width: 100%; background: #000; }
+
+    .server-bar {
+      padding: 6px 20px; display: flex; align-items: center; gap: 6px;
+      background: #0d0d0d; border-bottom: 1px solid #1a1a1a; flex-shrink: 0;
+      overflow-x: auto; scrollbar-width: none;
+    }
+    .server-bar::-webkit-scrollbar { display: none; }
+    .server-btn {
+      padding: 5px 12px; background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 4px;
+      color: #888; font-size: 12px; cursor: pointer; white-space: nowrap;
+    }
+    .server-btn:hover { background: #222; color: #ccc; }
+    .server-btn.active { background: #e50914; border-color: #e50914; color: #fff; }
+
+    .player-content { flex: 1; position: relative; background: #000; }
+    .player-content video { width: 100%; height: 100%; background: #000; }
 
     .loading { text-align: center; padding: 60px; color: #555; }
 
@@ -128,7 +143,10 @@
     <span class="now-playing" id="nowPlaying"></span>
     <span class="status" id="playerStatus"></span>
   </div>
-  <video id="videoPlayer" controls autoplay></video>
+  <div class="server-bar" id="serverBar"></div>
+  <div class="player-content" id="playerContent">
+    <video id="videoPlayer" controls autoplay></video>
+  </div>
 </div>
 
 <script>
@@ -136,6 +154,7 @@ const API = '';
 const IMG = 'https://image.tmdb.org/t/p';
 
 let searchTimer;
+let currentStreams = [];
 const searchInput = document.getElementById('searchInput');
 searchInput.addEventListener('input', () => {
   clearTimeout(searchTimer);
@@ -205,7 +224,7 @@ async function openDetail(id, type) {
         <h2>${title}</h2>
         <div class="meta-line">${year} &middot; ${type} ${data.runtime ? '&middot; ' + data.runtime + ' min' : ''}</div>
         <div class="overview">${data.overview || ''}</div>
-        ${type === 'movie' ? `<button class="play-btn" onclick="scrapeAndPlay(${id}, 'movie', '${title.replace(/'/g, "\\'")}')">play</button>` : ''}
+        ${type === 'movie' ? `<button class="play-btn" onclick="watchContent(${id}, 'movie', '${title.replace(/'/g, "\\'")}')">play</button>` : ''}
       </div>
     </div>`;
 
@@ -231,7 +250,7 @@ async function loadEpisodes(showId, seasonNum, showTitle) {
 
   const data = await api(`/api/tv/${showId}/season/${seasonNum}`);
   list.innerHTML = data.episodes.map(ep => `
-    <div class="episode-item" onclick="scrapeAndPlay(${showId}, 'tv', '${showTitle.replace(/'/g, "\\'")}', ${seasonNum}, ${ep.episode_number})">
+    <div class="episode-item" onclick="watchContent(${showId}, 'tv', '${showTitle.replace(/'/g, "\\'")}', ${seasonNum}, ${ep.episode_number})">
       <span class="ep-title">${ep.name}</span>
       <span class="ep-num">S${seasonNum}E${ep.episode_number}</span>
     </div>
@@ -242,78 +261,109 @@ function closeDetail() {
   document.getElementById('detailOverlay').classList.remove('active');
 }
 
-function playStream(stream, video, status) {
+function cleanupPlayer() {
+  const video = document.getElementById('videoPlayer');
+  video.pause();
+  video.removeAttribute('src');
+  video.load();
+  if (video._hls) { video._hls.destroy(); video._hls = null; }
+}
+
+function proxyUrl(url) {
+  return API + '/api/proxy?url=' + encodeURIComponent(url);
+}
+
+function playStream(stream, idx) {
+  cleanupPlayer();
+  const video = document.getElementById('videoPlayer');
+  const status = document.getElementById('playerStatus');
+
+  document.querySelectorAll('.server-btn').forEach(b => b.classList.remove('active'));
+  const btn = document.querySelector(`.server-btn[data-idx="${idx}"]`);
+  if (btn) btn.classList.add('active');
+
   if (stream.type === 'hls') {
-    const url = stream.playlist;
+    const src = proxyUrl(stream.url);
     if (Hls.isSupported()) {
       const hls = new Hls();
-      hls.loadSource(url);
+      hls.loadSource(src);
       hls.attachMedia(video);
       hls.on(Hls.Events.MANIFEST_PARSED, () => { video.play(); status.textContent = ''; });
       hls.on(Hls.Events.ERROR, (_e, data) => {
-        if (data.fatal) status.textContent = 'stream error';
+        if (data.fatal) status.textContent = 'stream error — try another server';
       });
       video._hls = hls;
     } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-      video.src = url;
+      video.src = src;
       video.play();
-      status.textContent = '';
     }
-    return true;
+    status.textContent = 'loading...';
+  } else {
+    video.src = proxyUrl(stream.url);
+    video.play();
+    status.textContent = '';
   }
-  if (stream.type === 'file') {
-    const qualities = stream.qualities;
-    const best = qualities
-      ? Object.values(qualities).sort((a, b) => (b.quality || 0) - (a.quality || 0))[0]
-      : null;
-    if (best?.url) {
-      video.src = best.url;
-      video.play();
-      status.textContent = '';
-      return true;
-    }
-  }
-  return false;
 }
 
-async function scrapeAndPlay(id, type, title, season, episode) {
+function renderServerBar(streams) {
+  const bar = document.getElementById('serverBar');
+  const seen = new Map();
+
+  // Dedupe by provider, keep first (best) per provider
+  const unique = [];
+  for (const s of streams) {
+    const key = s.provider + ':' + s.type;
+    if (!seen.has(key)) {
+      seen.set(key, true);
+      unique.push(s);
+    }
+  }
+
+  currentStreams = unique;
+  bar.innerHTML = unique.map((s, i) =>
+    `<button class="server-btn${i === 0 ? ' active' : ''}" data-idx="${i}" onclick="playStream(currentStreams[${i}], ${i})">${s.providerName}${s.quality ? ' ' + s.quality : ''}</button>`
+  ).join('');
+}
+
+async function watchContent(id, type, title, season, episode) {
   const overlay = document.getElementById('playerOverlay');
-  const video = document.getElementById('videoPlayer');
   const status = document.getElementById('playerStatus');
   const nowPlaying = document.getElementById('nowPlaying');
 
   overlay.classList.add('active');
   nowPlaying.textContent = type === 'tv' ? `${title} S${season}E${episode}` : title;
-  status.textContent = 'finding sources...';
-  video.src = '';
+  status.textContent = 'scraping sources...';
+  cleanupPlayer();
+  document.getElementById('serverBar').innerHTML = '';
 
-  const path = type === 'movie' ? `/api/scrape/movie/${id}` : `/api/scrape/tv/${id}/${season}/${episode}`;
+  const path = type === 'movie'
+    ? `/api/stream/movie/${id}`
+    : `/api/stream/tv/${id}/${season}/${episode}`;
 
   try {
-    const r = await fetch(API + path);
-    const data = await r.json();
+    const data = await api(path);
+    const streams = data.streams || [];
 
-    if (r.ok && data.stream) {
-      status.textContent = 'loading stream...';
-      if (playStream(data.stream, video, status)) return;
+    if (!streams.length) {
+      status.textContent = 'no streams found';
+      return;
     }
 
-    status.textContent = 'no sources available for this title';
+    renderServerBar(streams);
+    playStream(currentStreams[0], 0);
   } catch (e) {
     status.textContent = 'error: ' + e.message;
   }
 }
 
 document.getElementById('playerClose').addEventListener('click', () => {
-  const video = document.getElementById('videoPlayer');
-  video.pause();
-  video.src = '';
-  if (video._hls) { video._hls.destroy(); video._hls = null; }
+  cleanupPlayer();
   document.getElementById('playerOverlay').classList.remove('active');
 });
 
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') {
+    cleanupPlayer();
     document.getElementById('playerOverlay').classList.remove('active');
     closeDetail();
   }
