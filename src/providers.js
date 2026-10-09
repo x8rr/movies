@@ -43,106 +43,104 @@ async function decryptStreamUrls(encB64, vs) {
 }
 
 async function vidsrcFetch(url, referer) {
-  const r = await fetch(url, {
+  return fetch(url, {
     headers: { "User-Agent": UA, Referer: referer },
   });
-  return r;
 }
 
 async function vidsrcExtract(type, tmdbId, season, episode) {
-  const isTV = type !== "movie";
-  const srcPath = isTV
-    ? `${tmdbId}/${season}/${episode}`
-    : String(tmdbId);
+  try {
+    const isTV = type !== "movie";
+    const srcPath = isTV
+      ? `${tmdbId}/${season}/${episode}`
+      : String(tmdbId);
 
-  // Step 1: source URL
-  const apiResp = await vidsrcFetch(
-    `https://vidsrc.sh/vs_src.php?type=${isTV ? "tv" : "movie"}&id=${srcPath}`,
-    "https://vidsrc.sh/",
-  );
-  const { src } = await apiResp.json();
-  if (!src) return [];
+    const apiResp = await vidsrcFetch(
+      `https://vidsrc.sh/vs_src.php?type=${isTV ? "tv" : "movie"}&id=${srcPath}`,
+      "https://vidsrc.sh/",
+    );
+    const { src } = await apiResp.json();
+    if (!src) return [];
 
-  // Step 2: landing page → playerUrl
-  const landResp = await vidsrcFetch(src, "https://vidsrc.sh/");
-  const landHtml = await landResp.text();
-  const cfgMatch = landHtml.match(/window\.CFG\s*=\s*(\{[^}]+\})/);
-  if (!cfgMatch) return [];
-  const cfg = JSON.parse(cfgMatch[1]);
-  const origin = new URL(src).origin;
+    const landResp = await vidsrcFetch(src, "https://vidsrc.sh/");
+    const landHtml = await landResp.text();
+    const cfgMatch = landHtml.match(/window\.CFG\s*=\s*(\{[^}]+\})/);
+    if (!cfgMatch) return [];
+    const cfg = JSON.parse(cfgMatch[1]);
+    const origin = new URL(src).origin;
 
-  // Step 3: player page → apiToken
-  const playerResp = await vidsrcFetch(origin + cfg.playerUrl, origin + "/");
-  const playerHtml = await playerResp.text();
-  const configMatch = playerHtml.match(/window\.CONFIG\s*=\s*(\{.*?\});/s);
-  if (!configMatch) return [];
-  const config = JSON.parse(configMatch[1]);
-  if (!config.apiToken) return [];
+    const playerResp = await vidsrcFetch(origin + cfg.playerUrl, origin + "/");
+    const playerHtml = await playerResp.text();
+    const configMatch = playerHtml.match(/window\.CONFIG\s*=\s*(\{.*?\});/s);
+    if (!configMatch) return [];
+    const config = JSON.parse(configMatch[1]);
+    if (!config.apiToken) return [];
 
-  // Step 4: stream API — use raw TMDB ID, not the concatenated one from config
-  let streamApiUrl;
-  if (isTV) {
-    streamApiUrl = `https://data.vidsrc.sh/api.php?type=tv&tmdb=${tmdbId}&season=${season}&episode=${episode}&stream_urls&api_token=${encodeURIComponent(config.apiToken)}`;
-  } else {
-    streamApiUrl = `https://data.vidsrc.sh/api.php?type=movie&tmdb=${tmdbId}&stream_urls&api_token=${encodeURIComponent(config.apiToken)}`;
-  }
+    let streamApiUrl;
+    if (isTV) {
+      streamApiUrl = `https://data.vidsrc.sh/api.php?type=tv&tmdb=${tmdbId}&season=${season}&episode=${episode}&stream_urls&api_token=${encodeURIComponent(config.apiToken)}`;
+    } else {
+      streamApiUrl = `https://data.vidsrc.sh/api.php?type=movie&tmdb=${tmdbId}&stream_urls&api_token=${encodeURIComponent(config.apiToken)}`;
+    }
 
-  const streamResp = await vidsrcFetch(streamApiUrl, origin + "/");
-  const json = await streamResp.json();
-  if (String(json.status_code) !== "200" || !json.data) return [];
+    const streamResp = await vidsrcFetch(streamApiUrl, origin + "/");
+    const json = await streamResp.json();
+    if (String(json.status_code) !== "200" || !json.data) return [];
 
-  // Step 5: decrypt if needed
-  let urls;
-  if (typeof json.data.stream_urls === "string" && json.vs) {
-    urls = await decryptStreamUrls(json.data.stream_urls, json.vs);
-    if (!urls) return [];
-  } else if (Array.isArray(json.data.stream_urls)) {
-    urls = json.data.stream_urls;
-  } else {
+    let urls;
+    if (typeof json.data.stream_urls === "string" && json.vs) {
+      urls = await decryptStreamUrls(json.data.stream_urls, json.vs);
+      if (!urls) return [];
+    } else if (Array.isArray(json.data.stream_urls)) {
+      urls = json.data.stream_urls;
+    } else {
+      return [];
+    }
+
+    const hostTokens = new Map();
+    for (const u of urls) {
+      const host = new URL(u).origin;
+      if (!hostTokens.has(host)) {
+        hostTokens.set(
+          host,
+          fetch(host + "/generate.php", {
+            headers: { "User-Agent": UA, Accept: "application/json" },
+          })
+            .then((r) => r.text())
+            .then((t) => {
+              try {
+                const j = JSON.parse(t);
+                return typeof j === "string"
+                  ? j
+                  : j.token || j.data || j.string || j.result || "";
+              } catch {
+                return t.trim();
+              }
+            })
+            .catch(() => ""),
+        );
+      }
+    }
+
+    const results = [];
+    for (const rawUrl of urls) {
+      const host = new URL(rawUrl).origin;
+      const token = await hostTokens.get(host);
+      const url = token
+        ? rawUrl + (rawUrl.includes("?") ? "&" : "?") + "token=" + token
+        : rawUrl;
+      results.push({
+        url,
+        type: rawUrl.includes(".m3u8") ? "hls" : "file",
+        provider: "vidsrc",
+        providerName: "VidSrc",
+      });
+    }
+    return results;
+  } catch (e) {
+    console.log("[vidsrc] error:", e.message);
     return [];
   }
-
-  // Step 6: get per-host playback tokens
-  const hostTokens = new Map();
-  for (const u of urls) {
-    const host = new URL(u).origin;
-    if (!hostTokens.has(host)) {
-      hostTokens.set(
-        host,
-        fetch(host + "/generate.php", {
-          headers: { "User-Agent": UA, Accept: "application/json" },
-        })
-          .then((r) => r.text())
-          .then((t) => {
-            try {
-              const j = JSON.parse(t);
-              return typeof j === "string"
-                ? j
-                : j.token || j.data || j.string || j.result || "";
-            } catch {
-              return t.trim();
-            }
-          })
-          .catch(() => ""),
-      );
-    }
-  }
-
-  const results = [];
-  for (const rawUrl of urls) {
-    const host = new URL(rawUrl).origin;
-    const token = await hostTokens.get(host);
-    const url = token
-      ? rawUrl + (rawUrl.includes("?") ? "&" : "?") + "token=" + token
-      : rawUrl;
-    results.push({
-      url,
-      type: rawUrl.includes(".m3u8") ? "hls" : "file",
-      provider: "vidsrc",
-      providerName: "VidSrc",
-    });
-  }
-  return results;
 }
 
 const PROVIDERS = [
@@ -151,14 +149,8 @@ const PROVIDERS = [
 
 export async function scrapeAll(type, tmdbId, season, episode) {
   const results = await Promise.allSettled(
-    PROVIDERS.map(async (p) => {
-      console.log(`[providers] scraping ${p.name}...`);
-      const streams = await p.extract(type, tmdbId, season, episode);
-      console.log(`[providers] ${p.name}: ${streams.length} stream(s)`);
-      return streams;
-    }),
+    PROVIDERS.map((p) => p.extract(type, tmdbId, season, episode)),
   );
-
   return results.flatMap((r) => (r.status === "fulfilled" ? r.value : []));
 }
 

@@ -233,32 +233,5 @@ router.get("/proxy", async (req, res) => {
   }
 });
 
-// Keep legacy scrape endpoints
-router.get("/scrape/movie/:tmdbId", async (req, res) => {
-  try {
-    const media = await buildMovieMedia(req.params.tmdbId);
-    const { result, tried } = await scrapeWithEvents(media);
-    if (!result) {
-      return res.status(404).json({ error: "no sources found", tried });
-    }
-    res.json(result);
-  } catch (e) {
-    res.status(e.status || 500).json({ error: e.message });
-  }
-});
-
-router.get("/scrape/tv/:tmdbId/:season/:episode", async (req, res) => {
-  const { tmdbId, season, episode } = req.params;
-  try {
-    const media = await buildShowMedia(tmdbId, season, episode);
-    const { result, tried } = await scrapeWithEvents(media);
-    if (!result) {
-      return res.status(404).json({ error: "no sources found", tried });
-    }
-    res.json(result);
-  } catch (e) {
-    res.status(e.status || 500).json({ error: e.message });
-  }
-});
 
 export default router;

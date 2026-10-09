@@ -1,7 +1,7 @@
 {
   "name": "movies-api",
   "version": "1.0.0",
-  "description": "Lightweight self-hosted pstream-compatible backend",
+  "description": "Self-hosted movie streaming API",
   "type": "module",
   "main": "src/index.js",
   "scripts": {
@@ -11,10 +11,6 @@
   "dependencies": {
     "@p-stream/providers": "github:movie-web-rip/pstream-providers#production",
     "cors": "^2.8.5",
-    "express": "^5.1.0",
-    "jsonwebtoken": "^9.0.2",
-    "tweetnacl": "^1.0.3",
-    "tweetnacl-util": "^0.15.1",
-    "uuid": "^11.1.0"
+    "express": "^5.1.0"
   }
 }
