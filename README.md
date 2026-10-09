@@ -1,18 +1,13 @@
 # movies
 
-lightweight self-hosted movie streaming API with pstream-compatible sync backend. scrapes streaming sources via [@p-stream/providers](https://github.com/movie-web-rip/pstream-providers), proxies TMDB for metadata, and includes a basic web UI for searching and playing.
+lightweight self-hosted movie streaming API. scrapes actual m3u8 stream URLs via [VidSrc](https://vidsrc.sh) (HTTP + WASM decryption, no browser/puppeteer), proxies TMDB for metadata, and includes a web player with HLS.js.
 
-uses bun + SQLite, nothing else to set up.
+uses bun, nothing else to set up.
 
 ## setup
 
 ```
 cp .env.example .env
-```
-
-generate a secret and add it to `.env`:
-```
-openssl rand -hex 32
 ```
 
 get a TMDB API key from https://www.themoviedb.org/settings/api and add it to `.env`.
@@ -30,36 +25,21 @@ bun start
 docker compose up -d
 ```
 
-runs on port 3000 by default. data is stored in `./data/movies.db`.
+runs on port 3000 by default.
 
-## streaming
+## API
 
-- `GET /api/sources` - list available scraping providers
-- `GET /api/scrape/movie/:tmdbId` - scrape movie sources
-- `GET /api/scrape/tv/:tmdbId/:season/:episode` - scrape TV episode sources
-- `GET /api/search/:type?query=` - search TMDB (movie, tv, multi)
-- `GET /api/trending/:type/:window` - trending (all/movie/tv, day/week)
-- `GET /api/movie/:id` - movie details
-- `GET /api/tv/:id` - TV show details
-- `GET /api/tv/:id/season/:season` - season episodes
+### streaming
 
-## sync (pstream-compatible)
+- `GET /api/stream/movie/:tmdbId` — scrape movie streams
+- `GET /api/stream/tv/:tmdbId/:season/:episode` — scrape TV episode streams
+- `GET /api/proxy?url=` — CORS proxy for HLS playback (rewrites m3u8 segment URLs, propagates host tokens)
+- `GET /api/sources` — list available scraping providers
 
-point the pstream frontend at your instance URL and it works.
+### TMDB
 
-**auth** (ed25519 challenge-response)
-- `POST /auth/register/start` + `/auth/register/complete`
-- `POST /auth/login/start` + `/auth/login/complete`
-
-**users** (authenticated)
-- `GET /users/@me`, `PATCH /users/:id`, `DELETE /users/:id`
-
-**bookmarks** - `GET/PUT/POST/DELETE /users/:id/bookmarks`
-
-**progress** - `GET/PUT/DELETE /users/:id/progress/:tmdbid`
-
-**watch history** - `GET/PUT/DELETE /users/:id/watch-history/:tmdbid`
-
-**settings** - `GET/PUT /users/:id/settings`
-
-**sessions** - `GET /users/:id/sessions`, `PATCH/DELETE /sessions/:sid`
+- `GET /api/search/:type?query=` — search (movie, tv, multi)
+- `GET /api/trending/:type/:window` — trending (all/movie/tv, day/week)
+- `GET /api/movie/:id` — movie details
+- `GET /api/tv/:id` — TV show details
+- `GET /api/tv/:id/season/:season` — season episodes
