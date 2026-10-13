@@ -1,8 +1,27 @@
 import vm from "node:vm";
+import { Window } from "happy-dom";
 
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 const BASE = "https://cinesrc.st";
+
+const JS_BUILTINS = new Set([
+  "Object", "Function", "Array", "Number", "String", "Boolean", "Symbol",
+  "Date", "RegExp", "Error", "TypeError", "RangeError", "ReferenceError",
+  "SyntaxError", "URIError", "EvalError", "Map", "Set", "WeakMap", "WeakSet",
+  "Promise", "Proxy", "Reflect", "Math", "JSON", "parseInt", "parseFloat",
+  "isNaN", "isFinite", "NaN", "Infinity", "undefined", "eval", "globalThis",
+  "encodeURI", "decodeURI", "encodeURIComponent", "decodeURIComponent",
+  "escape", "unescape", "ArrayBuffer", "SharedArrayBuffer", "DataView",
+  "Int8Array", "Uint8Array", "Uint8ClampedArray", "Int16Array", "Uint16Array",
+  "Int32Array", "Uint32Array", "Float32Array", "Float64Array", "BigInt64Array",
+  "BigUint64Array", "BigInt", "WeakRef", "FinalizationRegistry", "Atomics",
+  "TextEncoder", "TextDecoder", "URL", "URLSearchParams", "atob", "btoa",
+  "setTimeout", "clearTimeout", "setInterval", "clearInterval",
+  "queueMicrotask", "structuredClone", "console", "crypto", "performance",
+  "WebAssembly", "Blob", "File", "FormData", "Headers", "Request", "Response",
+  "AbortController", "AbortSignal", "Intl",
+]);
 
 const scriptCache = new Map();
 
@@ -78,72 +97,111 @@ async function callAction(actionId, args, path, headers = {}) {
   return parseServerAction(await resp.text());
 }
 
-function makeSandboxWorker(url) {
-  const worker = {
-    _cbs: {},
-    _onmessage: null,
-    _w: null,
-    _ready: null,
+function makeSandboxWorker(url, blobStore, parentFetch) {
+  const messageCbs = [];
+  let onmessageFn = null;
+  let workerOnmessage = null;
+
+  const postToMain = (data) => {
+    queueMicrotask(() => {
+      const ev = { data };
+      for (const fn of messageCbs) fn(ev);
+      if (onmessageFn) onmessageFn(ev);
+    });
   };
 
-  worker._ready = (async () => {
-    let scriptUrl =
-      typeof url === "string"
-        ? url.startsWith("/")
-          ? BASE + url
-          : url
-        : url instanceof URL
-          ? url.href
-          : String(url);
+  const workerSelf = {
+    postMessage: postToMain,
+    addEventListener(type, fn) {
+      if (type === "message") workerOnmessage = fn;
+    },
+    onmessage: null,
+    importScripts() {},
+    location: { origin: BASE, href: BASE + "/" },
+    crypto: globalThis.crypto,
+    WebAssembly: globalThis.WebAssembly,
+    TextEncoder: globalThis.TextEncoder,
+    TextDecoder: globalThis.TextDecoder,
+  };
 
-    let code;
-    if (scriptUrl.startsWith("blob:")) {
-      code = await (await fetch(scriptUrl)).text();
-    } else {
-      code = await fetchScript(scriptUrl);
+  const workerFetch = (...args) => {
+    let u = typeof args[0] === "string" ? args[0] : args[0]?.url || String(args[0]);
+    if (u.startsWith("/")) u = BASE + u;
+    const opts = typeof args[1] === "object" ? { ...args[1] } : {};
+    const h = new Headers(opts.headers);
+    if (!h.has("User-Agent")) h.set("User-Agent", UA);
+    return fetch(u, { ...opts, headers: h });
+  };
+
+  let codePromise;
+  const scriptUrl = typeof url === "string"
+    ? url.startsWith("/") ? BASE + url : url
+    : url instanceof URL ? url.href : String(url);
+
+  if (scriptUrl.startsWith("blob:") && blobStore?.has(scriptUrl)) {
+    codePromise = blobStore.get(scriptUrl).text();
+  } else if (scriptUrl.startsWith("blob:")) {
+    codePromise = Promise.reject(new Error("blob URL not in store"));
+  } else {
+    codePromise = fetchScript(scriptUrl);
+  }
+
+  const readyPromise = codePromise.then(async (code) => {
+    const workerWin = new Window({ url: BASE + "/" });
+    const workerCtx = {};
+    for (const key of Object.getOwnPropertyNames(globalThis)) {
+      try { workerCtx[key] = globalThis[key]; } catch {}
+    }
+    for (const key of Object.getOwnPropertyNames(workerWin)) {
+      if (!JS_BUILTINS.has(key)) {
+        try { workerCtx[key] = workerWin[key]; } catch {}
+      }
     }
 
-    const { Worker: W } = await import("node:worker_threads");
-    const shim = [
-      'const{parentPort}=require("worker_threads");',
-      "const self={postMessage:d=>parentPort.postMessage(d),",
-      'addEventListener:(e,fn)=>{if(e==="message")parentPort.on("message",d=>fn({data:d}));}};',
-      "globalThis.self=self;globalThis.postMessage=self.postMessage;",
-      "globalThis.addEventListener=self.addEventListener;globalThis.onmessage=null;",
-      code,
-      'if(typeof globalThis.onmessage==="function")parentPort.on("message",d=>globalThis.onmessage({data:d}));',
-    ].join("\n");
-
-    worker._w = new W(shim, { eval: true });
-    worker._w.on("message", (data) => {
-      for (const fn of worker._cbs.message || []) fn({ data });
-      if (worker._onmessage) worker._onmessage({ data });
+    Object.assign(workerCtx, {
+      postMessage: postToMain,
+      addEventListener: workerSelf.addEventListener.bind(workerSelf),
+      onmessage: null,
+      importScripts() {},
+      fetch: workerFetch,
+      location: workerSelf.location,
+      navigator: { userAgent: UA, language: "en-US", languages: ["en-US"],
+        platform: "Win32", hardwareConcurrency: 8, onLine: true },
     });
-    worker._w.on("error", (e) => {
-      for (const fn of worker._cbs.error || []) fn(e);
-    });
-  })().catch((e) => console.error("[cinesrc worker]", e.message));
+    workerCtx.self = workerCtx;
+    workerCtx.window = workerCtx;
+    workerCtx.globalThis = workerCtx;
+    const wCtx = vm.createContext(workerCtx);
+    vm.runInContext(code, wCtx, { timeout: 30000 });
+    if (typeof workerCtx.onmessage === "function") {
+      workerOnmessage = (ev) => workerCtx.onmessage(ev);
+    }
+    try { workerWin.close(); } catch {}
+    return wCtx;
+  }).catch((e) => console.error("[cinesrc worker]", e.message));
 
   return {
     postMessage(data) {
-      worker._ready.then(() => {
-        if (worker._w) worker._w.postMessage(data);
+      readyPromise.then(() => {
+        const ev = { data };
+        if (workerOnmessage) workerOnmessage(ev);
+        if (workerSelf.onmessage) workerSelf.onmessage(ev);
       });
     },
     addEventListener(type, fn) {
-      (worker._cbs[type] ??= []).push(fn);
+      if (type === "message") messageCbs.push(fn);
     },
-    terminate() {
-      worker._w?.terminate();
-    },
-    set onmessage(fn) { worker._onmessage = fn; },
-    get onmessage() { return worker._onmessage; },
+    terminate() {},
+    set onmessage(fn) { onmessageFn = fn; },
+    get onmessage() { return onmessageFn; },
   };
 }
 
 function buildContext(embedPath, searchStr, encoded, rToken, pToken) {
   const loadedScripts = new Map();
-  const eventMap = {};
+  const fullUrl = BASE + embedPath + searchStr;
+
+  const win = new Window({ url: fullUrl });
 
   const patchedFetch = (...args) => {
     let url =
@@ -167,7 +225,7 @@ function buildContext(embedPath, searchStr, encoded, rToken, pToken) {
       h.set("x-cs-q", encoded);
       if (parsed.pathname === "/api/c/issue") h.set("x-cs-p", pToken);
       h.set("User-Agent", UA);
-      h.set("Referer", BASE + embedPath);
+      h.set("Referer", fullUrl);
       return fetch(url, { ...opts, headers: h });
     }
 
@@ -177,150 +235,171 @@ function buildContext(embedPath, searchStr, encoded, rToken, pToken) {
     return fetch(url, { ...opts, headers: h });
   };
 
-  // Start with every global from the real runtime
   const ctx = {};
   for (const key of Object.getOwnPropertyNames(globalThis)) {
-    try {
-      ctx[key] = globalThis[key];
-    } catch {}
+    try { ctx[key] = globalThis[key]; } catch {}
+  }
+  for (const key of Object.getOwnPropertyNames(win)) {
+    if (!JS_BUILTINS.has(key)) {
+      try { ctx[key] = win[key]; } catch {}
+    }
   }
 
-  // Browser polyfills
   ctx.window = ctx;
   ctx.self = ctx;
   ctx.globalThis = ctx;
-
-  ctx.location = {
-    pathname: embedPath,
-    search: searchStr,
-    href: BASE + embedPath + searchStr,
-    origin: BASE,
-    host: "cinesrc.st",
-    hostname: "cinesrc.st",
-    protocol: "https:",
-    port: "",
-    hash: "",
-    replace() {},
-    assign() {},
-    reload() {},
-    toString() { return this.href; },
-  };
-
-  ctx.navigator = { userAgent: UA, language: "en-US", languages: ["en-US"] };
   ctx.fetch = patchedFetch;
-  ctx.Worker = function WorkerShim(url) { return makeSandboxWorker(url); };
-  ctx.__ss2_challenge = null;
+  ctx.navigator = {
+    userAgent: UA, language: "en-US", languages: ["en-US"],
+    platform: "Win32", vendor: "Google Inc.", appVersion: UA.slice(8),
+    cookieEnabled: true, onLine: true, hardwareConcurrency: 8,
+    maxTouchPoints: 0, doNotTrack: null,
+    plugins: { length: 5, item: () => null, namedItem: () => null, refresh: () => {} },
+    mimeTypes: { length: 4, item: () => null, namedItem: () => null },
+    connection: { effectiveType: "4g", rtt: 50, downlink: 10, saveData: false },
+    getBattery: () => Promise.resolve({ charging: true, chargingTime: 0, dischargingTime: Infinity, level: 1 }),
+    sendBeacon: () => true,
+    mediaDevices: { enumerateDevices: () => Promise.resolve([]) },
+    storage: { estimate: () => Promise.resolve({ quota: 1e10, usage: 0 }) },
+    permissions: { query: () => Promise.resolve({ state: "prompt" }) },
+    clipboard: { readText: () => Promise.resolve(""), writeText: () => Promise.resolve() },
+  };
+  ctx.screen = {
+    width: 1920, height: 1080, availWidth: 1920, availHeight: 1040,
+    colorDepth: 24, pixelDepth: 24,
+    orientation: { type: "landscape-primary", angle: 0 },
+  };
+  ctx.devicePixelRatio = 1;
+  ctx.innerWidth = 1920;
+  ctx.innerHeight = 1080;
+  ctx.outerWidth = 1920;
+  ctx.outerHeight = 1080;
 
-  ctx.addEventListener = (type, fn) => {
-    (eventMap[type] ??= []).push(fn);
+  const blobStore = new Map();
+  ctx.URL = { ...URL };
+  ctx.URL.createObjectURL = (blob) => {
+    const id = "blob:cinesrc/" + Math.random().toString(36).slice(2);
+    blobStore.set(id, blob);
+    return id;
   };
-  ctx.removeEventListener = (type, fn) => {
-    if (eventMap[type]) eventMap[type] = eventMap[type].filter((f) => f !== fn);
-  };
-  ctx.dispatchEvent = (ev) => {
-    const t = ev?.type || ev;
-    for (const fn of eventMap[t] || []) {
-      try { fn(ev); } catch (e) { console.error("[cinesrc event]", e.message); }
-    }
-    return true;
-  };
-
-  ctx.CustomEvent = class CustomEvent {
-    constructor(type, opts = {}) {
-      this.type = type;
-      this.detail = opts.detail ?? null;
-    }
-  };
-  ctx.Event = class SEvent {
-    constructor(type) { this.type = type; }
-  };
+  ctx.URL.revokeObjectURL = (url) => blobStore.delete(url);
+  ctx.Worker = function WorkerShim(url) { return makeSandboxWorker(url, blobStore, patchedFetch); };
 
   let vmCtx;
   const runCode = (code) => vm.runInContext(code, vmCtx, { timeout: 30000 });
 
-  const makeScriptEl = () => {
-    const el = {
-      tagName: "SCRIPT",
-      src: "",
-      dataset: {},
-      async: false,
-      noModule: false,
-      type: "",
-      textContent: "",
-      crossOrigin: null,
-      _evts: {},
-      addEventListener(ev, fn, opts) {
-        (el._evts[ev] ??= []).push({ fn, once: opts?.once });
+  function makeCanvasMock() {
+    const mock = {
+      tagName: "CANVAS", width: 300, height: 150, style: {},
+      getContext() {
+        return {
+          fillStyle: "", strokeStyle: "", font: "10px sans-serif",
+          textAlign: "start", textBaseline: "alphabetic",
+          globalAlpha: 1, globalCompositeOperation: "source-over",
+          fillRect() {}, clearRect() {}, strokeRect() {},
+          fillText() {}, strokeText() {},
+          measureText() { return { width: 0 }; },
+          beginPath() {}, closePath() {}, moveTo() {}, lineTo() {},
+          arc() {}, arcTo() {}, bezierCurveTo() {}, quadraticCurveTo() {}, rect() {},
+          fill() {}, stroke() {}, clip() {},
+          save() {}, restore() {},
+          translate() {}, rotate() {}, scale() {}, transform() {}, setTransform() {},
+          drawImage() {},
+          createLinearGradient() { return { addColorStop() {} }; },
+          createRadialGradient() { return { addColorStop() {} }; },
+          getImageData() { return { data: new Uint8ClampedArray(300 * 150 * 4) }; },
+          putImageData() {},
+          canvas: mock,
+        };
       },
-      removeEventListener(ev, fn) {
-        if (el._evts[ev]) el._evts[ev] = el._evts[ev].filter((h) => h.fn !== fn);
-      },
-      _fire(ev) {
-        for (const h of el._evts[ev] || []) { try { h.fn(); } catch {} }
-        el._evts[ev] = (el._evts[ev] || []).filter((h) => !h.once);
-      },
-      remove() {},
+      toDataURL() { return "data:image/png;base64,iVBORw0KGgo="; },
+      toBlob(cb) { cb?.(new Blob()); },
     };
-    return el;
-  };
+    return mock;
+  }
 
-  ctx.document = {
-    createElement(tag) {
-      if (tag === "script") return makeScriptEl();
-      if (tag === "link")
-        return { tagName: "LINK", rel: "", href: "", as: "", type: "", crossOrigin: "", dataset: {} };
-      return { tagName: tag.toUpperCase(), style: {} };
-    },
-    head: {
-      appendChild(el) {
-        if (el.tagName !== "SCRIPT") return el;
-        const src = el.src || el.dataset?.src;
-        if (src) {
-          loadedScripts.set(src, el);
-          const url = src.startsWith("/") ? BASE + src : src;
-          fetchScript(url)
-            .then((code) => {
-              try { runCode(code); } catch (e) {
-                console.error("[cinesrc eval]", src, e.message);
-              }
-              el._fire("load");
-            })
-            .catch((e) => {
-              console.error("[cinesrc fetch]", src, e.message);
-              el._fire("error");
-            });
-        } else if (el.textContent) {
-          try { runCode(el.textContent); } catch {}
+  function handleAppendChild(child) {
+    if (child?.tagName === "SCRIPT" || child?.tagName === "script") {
+      const src = child.src || child.dataset?.src;
+      if (src) {
+        loadedScripts.set(src, child);
+        const url = src.startsWith("/") ? BASE + src : src;
+        fetchScript(url)
+          .then((code) => {
+            try { runCode(code); } catch (e) {
+              console.error("[cinesrc eval]", src, e.message);
+            }
+            if (child.onload) child.onload();
+            try { child.dispatchEvent?.(new Event("load")); } catch {}
+          })
+          .catch((e) => {
+            console.error("[cinesrc fetch]", src, e.message);
+            if (child.onerror) child.onerror(e);
+          });
+      } else if (child.textContent) {
+        try { runCode(child.textContent); } catch {}
+      }
+      return child;
+    }
+    return child;
+  }
+
+  if (ctx.document) {
+    const doc = ctx.document;
+    const origCE = doc.createElement?.bind(doc);
+    const origQS = doc.querySelector?.bind(doc);
+    const origQSA = doc.querySelectorAll?.bind(doc);
+
+    ctx.document = new Proxy(doc, {
+      get(target, prop) {
+        if (prop === "createElement") {
+          return (tag, ...rest) => {
+            if (tag === "canvas") return makeCanvasMock();
+            return origCE(tag, ...rest);
+          };
         }
-        return el;
+        if (prop === "head" || prop === "body") {
+          const el = target[prop];
+          return new Proxy(el, {
+            get(t, p) {
+              if (p === "appendChild") return handleAppendChild;
+              const v = t[p];
+              return typeof v === "function" ? v.bind(t) : v;
+            },
+          });
+        }
+        if (prop === "querySelector") {
+          return (sel) => {
+            const m = sel.match(/script\[data-src(?:\^)?="([^"]+)"\]/);
+            if (m) {
+              for (const [k, v] of loadedScripts) if (k.startsWith(m[1])) return v;
+            }
+            return origQS(sel);
+          };
+        }
+        if (prop === "querySelectorAll") {
+          return (sel) => {
+            const m = sel.match(/script\[data-src\^="([^"]+)"\]/);
+            if (m) {
+              const out = [];
+              for (const [k, v] of loadedScripts) if (k.startsWith(m[1])) out.push(v);
+              if (out.length) return out;
+            }
+            return origQSA(sel);
+          };
+        }
+        const val = target[prop];
+        return typeof val === "function" ? val.bind(target) : val;
       },
-    },
-    body: { appendChild(el) { return ctx.document.head.appendChild(el); } },
-    querySelector(sel) {
-      const m = sel.match(/script\[data-src(?:\^)?="([^"]+)"\]/);
-      if (m) {
-        for (const [k, v] of loadedScripts) if (k.startsWith(m[1])) return v;
-      }
-      return null;
-    },
-    querySelectorAll(sel) {
-      const m = sel.match(/script\[data-src\^="([^"]+)"\]/);
-      if (m) {
-        const out = [];
-        for (const [k, v] of loadedScripts) if (k.startsWith(m[1])) out.push(v);
-        return out;
-      }
-      return [];
-    },
-    documentElement: { style: {} },
-  };
+    });
+  }
 
   vmCtx = vm.createContext(ctx);
-  return { ctx, vmCtx, runCode };
+  return { ctx, vmCtx, runCode, win };
 }
 
 async function solveChallenge(encoded, rToken, pToken, embedPath, searchStr) {
-  const { ctx, vmCtx, runCode } = buildContext(
+  const { ctx, vmCtx, runCode, win } = buildContext(
     embedPath, searchStr, encoded, rToken, pToken,
   );
 
@@ -332,41 +411,46 @@ async function solveChallenge(encoded, rToken, pToken, embedPath, searchStr) {
   runCode(donutCode);
   await new Promise((r) => setTimeout(r, 300));
 
-  const csPromise = new Promise((resolve, reject) => {
-    const t = setTimeout(() => reject(new Error("_cs timeout")), 20000);
-    ctx.addEventListener("_cs", (ev) => {
-      clearTimeout(t);
-      resolve(ev?.detail || ev);
+  runCode(`
+    window.__csApi = null;
+    window.addEventListener("_cs", function(ev) {
+      window.__csApi = window[ev.detail] || ev.detail;
     });
-  });
+  `);
 
   runCode(prodCode);
 
-  let challengeApi;
-  try {
-    challengeApi = await csPromise;
-  } catch {
-    // Fallback: scan context for the module
-    for (let i = 0; i < 30; i++) {
-      await new Promise((r) => setTimeout(r, 300));
-      for (const key of Object.keys(ctx)) {
-        const v = ctx[key];
-        if (v && typeof v === "object" && typeof v.gc === "function" && typeof v.dr === "function") {
-          challengeApi = v;
-          break;
-        }
+  await new Promise((r) => setTimeout(r, 500));
+
+  let challengeApi = vmCtx.__csApi;
+
+  if (!challengeApi?.gc) {
+    for (let i = 0; i < 20; i++) {
+      await new Promise((r) => setTimeout(r, 500));
+      challengeApi = vmCtx.__csApi;
+      if (challengeApi?.gc) break;
+      for (const key of Object.getOwnPropertyNames(vmCtx)) {
+        try {
+          const v = vmCtx[key];
+          if (v && typeof v === "object" && typeof v.gc === "function" && typeof v.dr === "function") {
+            challengeApi = v;
+            break;
+          }
+        } catch {}
       }
-      if (challengeApi) break;
+      if (challengeApi?.gc) break;
     }
   }
 
   if (!challengeApi?.gc)
     throw new Error("challenge API not captured");
 
-  const ss2 = ctx.__ss2_challenge;
+  const ss2 = vmCtx.__ss2_challenge;
   if (!ss2?.gc) throw new Error("stage2 challenge not available");
 
   const [tok1, tok2] = await Promise.all([challengeApi.gc(), ss2.gc()]);
+
+  try { win.close(); } catch {}
 
   return {
     token: tok1 + "::c2::" + tok2 + "::c3::" + rToken,
@@ -429,8 +513,9 @@ export async function cinesrcExtract(type, tmdbId, season, episode) {
 
         const urls = Array.isArray(data.url) ? data.url : [data.url];
         for (const u of urls) {
-          const streamUrl = typeof u === "string" ? u : u?.url || u?.source;
+          let streamUrl = typeof u === "string" ? u : u?.url || u?.source;
           if (!streamUrl) continue;
+          if (streamUrl.startsWith("/")) streamUrl = BASE + streamUrl;
           results.push({
             url: streamUrl,
             type: streamUrl.includes(".m3u8") ? "hls" : "file",
@@ -446,7 +531,7 @@ export async function cinesrcExtract(type, tmdbId, season, episode) {
 
     return results;
   } catch (e) {
-    console.log("[cinesrc] error:", e.message);
+    console.log("[cinesrc] error:", e.stack || e.message);
     return [];
   }
 }
