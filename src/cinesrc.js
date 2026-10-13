@@ -1,5 +1,3 @@
-import { createContext, runInContext } from "node:vm";
-
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 const BASE = "https://cinesrc.st";
@@ -78,9 +76,73 @@ async function callAction(actionId, args, path, headers = {}) {
   return parseServerAction(await resp.text());
 }
 
-function buildSandbox(embedPath, searchStr, encoded, rToken, pToken) {
-  const eventMap = {};
+class SandboxWorker {
+  constructor(url) {
+    this._cbs = {};
+    this._onmessage = null;
+    this._w = null;
+
+    const self = this;
+    this._ready = (async () => {
+      let scriptUrl =
+        typeof url === "string"
+          ? url.startsWith("/")
+            ? BASE + url
+            : url
+          : url instanceof URL
+            ? url.href
+            : String(url);
+
+      let code;
+      if (scriptUrl.startsWith("blob:")) {
+        code = await (await fetch(scriptUrl)).text();
+      } else {
+        code = await fetchScript(scriptUrl);
+      }
+
+      const { Worker: W } = await import("node:worker_threads");
+      const shim = [
+        'const{parentPort}=require("worker_threads");',
+        "const self={postMessage:d=>parentPort.postMessage(d),",
+        'addEventListener:(e,fn)=>{if(e==="message")parentPort.on("message",d=>fn({data:d}));}};',
+        "globalThis.self=self;globalThis.postMessage=self.postMessage;",
+        "globalThis.addEventListener=self.addEventListener;globalThis.onmessage=null;",
+        code,
+        'if(typeof globalThis.onmessage==="function")parentPort.on("message",d=>globalThis.onmessage({data:d}));',
+      ].join("\n");
+
+      self._w = new W(shim, { eval: true });
+      self._w.on("message", (data) => {
+        for (const fn of self._cbs.message || []) fn({ data });
+        if (self._onmessage) self._onmessage({ data });
+      });
+      self._w.on("error", (e) => {
+        for (const fn of self._cbs.error || []) fn(e);
+      });
+    })().catch((e) => console.error("[worker init]", e.message));
+  }
+
+  postMessage(data) {
+    this._ready.then(() => {
+      if (this._w) this._w.postMessage(data);
+    });
+  }
+
+  addEventListener(type, fn) {
+    (this._cbs[type] ??= []).push(fn);
+  }
+
+  terminate() {
+    this._w?.terminate();
+  }
+
+  set onmessage(fn) { this._onmessage = fn; }
+  get onmessage() { return this._onmessage; }
+}
+
+async function solveChallenge(encoded, rToken, pToken, embedPath, searchStr) {
   const loadedScripts = new Map();
+  const eventMap = {};
 
   const patchedFetch = (...args) => {
     let url =
@@ -108,508 +170,180 @@ function buildSandbox(embedPath, searchStr, encoded, rToken, pToken) {
       return fetch(url, { ...opts, headers: h });
     }
 
-    if (!opts.headers) opts.headers = {};
     const h = new Headers(opts.headers);
     if (!h.has("User-Agent")) h.set("User-Agent", UA);
     if (!h.has("Referer")) h.set("Referer", BASE + "/");
     return fetch(url, { ...opts, headers: h });
   };
 
-  const ctx = {
-    console,
-    setTimeout,
-    setInterval,
-    clearTimeout,
-    clearInterval,
-    queueMicrotask,
-    Promise,
-    URL,
-    URLSearchParams,
-    Headers,
-    Request,
-    Response,
-    TextEncoder,
-    TextDecoder,
-    Uint8Array,
-    Int8Array,
-    Uint16Array,
-    Int16Array,
-    Uint32Array,
-    Int32Array,
-    Float32Array,
-    Float64Array,
-    BigInt64Array: globalThis.BigInt64Array,
-    BigUint64Array: globalThis.BigUint64Array,
-    ArrayBuffer,
-    SharedArrayBuffer: globalThis.SharedArrayBuffer,
-    DataView,
-    Map,
-    Set,
-    WeakMap,
-    WeakSet,
-    WeakRef: globalThis.WeakRef,
-    FinalizationRegistry: globalThis.FinalizationRegistry,
-    Symbol,
-    Proxy,
-    Reflect,
-    Error,
-    TypeError,
-    RangeError,
-    SyntaxError,
-    ReferenceError,
-    URIError,
-    EvalError,
-    AggregateError: globalThis.AggregateError,
-    JSON,
-    Math,
-    Number,
-    BigInt: globalThis.BigInt,
-    String,
-    Boolean,
-    Array,
-    Object,
-    Function,
-    RegExp,
-    Date,
-    parseInt,
-    parseFloat,
-    isNaN,
-    isFinite,
-    NaN,
-    Infinity,
-    undefined,
-    encodeURIComponent,
-    decodeURIComponent,
-    encodeURI,
-    decodeURI,
-    btoa,
-    atob,
-    WebAssembly,
-    crypto: globalThis.crypto,
-    performance: globalThis.performance,
-    structuredClone: globalThis.structuredClone,
-    Blob: globalThis.Blob,
-    File: globalThis.File,
-    FileReader: globalThis.FileReader,
-    AbortController: globalThis.AbortController,
-    AbortSignal: globalThis.AbortSignal,
-    EventTarget: globalThis.EventTarget,
+  const sandbox = Object.create(null);
 
-    navigator: { userAgent: UA, language: "en-US", languages: ["en-US", "en"] },
+  sandbox.window = sandbox;
+  sandbox.self = sandbox;
+  sandbox.globalThis = sandbox;
 
-    location: {
-      pathname: embedPath,
-      search: searchStr,
-      href: BASE + embedPath + searchStr,
-      origin: BASE,
-      host: "cinesrc.st",
-      hostname: "cinesrc.st",
-      protocol: "https:",
-      port: "",
-      hash: "",
-    },
-
-    fetch: patchedFetch,
-
-    addEventListener(type, fn) {
-      (eventMap[type] ??= []).push(fn);
-    },
-    removeEventListener(type, fn) {
-      if (eventMap[type]) eventMap[type] = eventMap[type].filter((f) => f !== fn);
-    },
-    dispatchEvent(ev) {
-      const t = ev?.type || ev;
-      for (const fn of eventMap[t] || []) {
-        try {
-          fn(ev);
-        } catch {}
-      }
-      return true;
-    },
-
-    CustomEvent: class CustomEvent {
-      constructor(type, opts = {}) {
-        this.type = type;
-        this.detail = opts.detail ?? null;
-      }
-    },
-    Event: class Event {
-      constructor(type) {
-        this.type = type;
-      }
-    },
-    MessageEvent: class MessageEvent {
-      constructor(type, opts = {}) {
-        this.type = type;
-        this.data = opts.data;
-      }
-    },
-
-    Worker: class SandboxWorker {
-      constructor(url) {
-        this._cbs = {};
-        this._onmessage = null;
-        this._ready = null;
-        this._w = null;
-        const self = this;
-
-        const init = async () => {
-          let scriptUrl =
-            typeof url === "string"
-              ? url.startsWith("/")
-                ? BASE + url
-                : url
-              : url instanceof URL
-                ? url.href
-                : String(url);
-          let code;
-          if (scriptUrl.startsWith("blob:")) {
-            code = await (await fetch(scriptUrl)).text();
-          } else {
-            code = await fetchScript(scriptUrl);
-          }
-          const { Worker: W } = await import("node:worker_threads");
-          const shim = `
-const{parentPort}=require("worker_threads");
-const self={postMessage:(d)=>parentPort.postMessage(d),addEventListener:(e,fn)=>{if(e==="message")parentPort.on("message",data=>fn({data}));}};
-globalThis.self=self;globalThis.postMessage=self.postMessage;globalThis.addEventListener=self.addEventListener;
-globalThis.onmessage=null;
-${code}
-if(typeof globalThis.onmessage==="function")parentPort.on("message",data=>globalThis.onmessage({data}));`;
-          self._w = new W(shim, { eval: true });
-          self._w.on("message", (data) => {
-            for (const fn of self._cbs.message || []) fn({ data });
-            if (self._onmessage) self._onmessage({ data });
-          });
-          self._w.on("error", (e) => {
-            for (const fn of self._cbs.error || []) fn(e);
-          });
-        };
-        this._ready = init().catch((e) =>
-          console.error("[worker init]", e.message),
-        );
-      }
-      postMessage(data) {
-        const go = () => {
-          if (this._w) this._w.postMessage(data);
-          else setTimeout(go, 5);
-        };
-        this._ready.then(go);
-      }
-      addEventListener(type, fn) {
-        (this._cbs[type] ??= []).push(fn);
-      }
-      terminate() {
-        this._w?.terminate();
-      }
-      set onmessage(fn) {
-        this._onmessage = fn;
-      }
-      get onmessage() {
-        return this._onmessage;
-      }
-    },
-
-    document: {
-      createElement(tag) {
-        if (tag === "script") {
-          const el = {
-            tagName: "SCRIPT",
-            src: "",
-            dataset: {},
-            async: false,
-            noModule: false,
-            type: "",
-            textContent: "",
-            crossOrigin: null,
-            _evts: {},
-            addEventListener(ev, fn, opts) {
-              (el._evts[ev] ??= []).push({ fn, once: opts?.once });
-            },
-            removeEventListener(ev, fn) {
-              if (el._evts[ev])
-                el._evts[ev] = el._evts[ev].filter((h) => h.fn !== fn);
-            },
-            _fire(ev) {
-              for (const h of el._evts[ev] || []) {
-                try {
-                  h.fn();
-                } catch {}
-              }
-              el._evts[ev] = (el._evts[ev] || []).filter((h) => !h.once);
-            },
-            remove() {},
-          };
-          return el;
-        }
-        if (tag === "link")
-          return {
-            tagName: "LINK",
-            rel: "",
-            href: "",
-            as: "",
-            type: "",
-            crossOrigin: "",
-            dataset: {},
-          };
-        return { tagName: tag.toUpperCase(), style: {} };
-      },
-      head: {
-        appendChild(el) {
-          if (el.tagName !== "SCRIPT") return el;
-          const src = el.src || el.dataset?.src;
-          if (src) {
-            loadedScripts.set(src, el);
-            const url = src.startsWith("/") ? BASE + src : src;
-            fetchScript(url)
-              .then((code) => {
-                try {
-                  runInContext(code, vmCtx, { timeout: 30000 });
-                } catch (e) {
-                  console.error("[sandbox eval]", src, e.message);
-                }
-                el._fire("load");
-              })
-              .catch((e) => {
-                console.error("[sandbox fetch]", src, e.message);
-                el._fire("error");
-              });
-          } else if (el.textContent) {
-            try {
-              runInContext(el.textContent, vmCtx, { timeout: 5000 });
-            } catch {}
-          }
-          return el;
-        },
-      },
-      body: {
-        appendChild(el) {
-          return ctx.document.head.appendChild(el);
-        },
-      },
-      querySelector(sel) {
-        const m =
-          sel.match(/script\[data-src="([^"]+)"\]/) ||
-          sel.match(/script\[data-src\^="([^"]+)"\]/);
-        if (m) {
-          for (const [k, v] of loadedScripts) if (k.startsWith(m[1])) return v;
-          return null;
-        }
-        return null;
-      },
-      querySelectorAll(sel) {
-        const m = sel.match(/script\[data-src\^="([^"]+)"\]/);
-        if (m) {
-          const out = [];
-          for (const [k, v] of loadedScripts) if (k.startsWith(m[1])) out.push(v);
-          return out;
-        }
-        return [];
-      },
-      documentElement: { style: {} },
-    },
+  sandbox.location = {
+    pathname: embedPath,
+    search: searchStr,
+    href: BASE + embedPath + searchStr,
+    origin: BASE,
+    host: "cinesrc.st",
+    hostname: "cinesrc.st",
+    protocol: "https:",
+    port: "",
+    hash: "",
   };
 
-  ctx.self = ctx;
-  ctx.window = ctx;
-  ctx.globalThis = ctx;
+  sandbox.navigator = { userAgent: UA, language: "en-US", languages: ["en-US"] };
+  sandbox.fetch = patchedFetch;
+  sandbox.Worker = SandboxWorker;
+  sandbox.__ss2_challenge = null;
 
-  let vmCtx;
-  try {
-    vmCtx = createContext(ctx);
-  } catch {
-    vmCtx = ctx;
-  }
+  sandbox.addEventListener = (type, fn) => {
+    (eventMap[type] ??= []).push(fn);
+  };
+  sandbox.removeEventListener = (type, fn) => {
+    if (eventMap[type]) eventMap[type] = eventMap[type].filter((f) => f !== fn);
+  };
+  sandbox.dispatchEvent = (ev) => {
+    const t = ev?.type || ev;
+    for (const fn of eventMap[t] || []) {
+      try { fn(ev); } catch {}
+    }
+    return true;
+  };
 
-  return { ctx, vmCtx };
-}
+  sandbox.CustomEvent = class CustomEvent {
+    constructor(type, opts = {}) {
+      this.type = type;
+      this.detail = opts.detail ?? null;
+    }
+  };
+  sandbox.Event = class SEvent {
+    constructor(type) { this.type = type; }
+  };
 
-async function solveChallenge(encoded, rToken, pToken, embedPath, searchStr) {
-  const { ctx, vmCtx } = buildSandbox(
-    embedPath,
-    searchStr,
-    encoded,
-    rToken,
-    pToken,
-  );
+  const makeScriptEl = () => {
+    const el = {
+      tagName: "SCRIPT",
+      src: "",
+      dataset: {},
+      async: false,
+      noModule: false,
+      type: "",
+      textContent: "",
+      crossOrigin: null,
+      _evts: {},
+      addEventListener(ev, fn, opts) {
+        (el._evts[ev] ??= []).push({ fn, once: opts?.once });
+      },
+      removeEventListener(ev, fn) {
+        if (el._evts[ev]) el._evts[ev] = el._evts[ev].filter((h) => h.fn !== fn);
+      },
+      _fire(ev) {
+        for (const h of el._evts[ev] || []) { try { h.fn(); } catch {} }
+        el._evts[ev] = (el._evts[ev] || []).filter((h) => !h.once);
+      },
+      remove() {},
+    };
+    return el;
+  };
+
+  const runCode = (code) => {
+    const fn = new Function("sandbox", `with(sandbox){${code}\n}`);
+    fn(sandbox);
+  };
+
+  sandbox.document = {
+    createElement(tag) {
+      if (tag === "script") return makeScriptEl();
+      if (tag === "link")
+        return { tagName: "LINK", rel: "", href: "", as: "", type: "", crossOrigin: "", dataset: {} };
+      return { tagName: tag.toUpperCase(), style: {} };
+    },
+    head: {
+      appendChild(el) {
+        if (el.tagName !== "SCRIPT") return el;
+        const src = el.src || el.dataset?.src;
+        if (src) {
+          loadedScripts.set(src, el);
+          const url = src.startsWith("/") ? BASE + src : src;
+          fetchScript(url)
+            .then((code) => {
+              try { runCode(code); } catch (e) {
+                console.error("[cinesrc sandbox]", src, e.message);
+              }
+              el._fire("load");
+            })
+            .catch((e) => {
+              console.error("[cinesrc fetch]", src, e.message);
+              el._fire("error");
+            });
+        } else if (el.textContent) {
+          try { runCode(el.textContent); } catch {}
+        }
+        return el;
+      },
+    },
+    body: { appendChild(el) { return sandbox.document.head.appendChild(el); } },
+    querySelector(sel) {
+      const m = sel.match(/script\[data-src(?:\^)?="([^"]+)"\]/);
+      if (m) {
+        for (const [k, v] of loadedScripts) if (k.startsWith(m[1])) return v;
+      }
+      return null;
+    },
+    querySelectorAll(sel) {
+      const m = sel.match(/script\[data-src\^="([^"]+)"\]/);
+      if (m) {
+        const out = [];
+        for (const [k, v] of loadedScripts) if (k.startsWith(m[1])) out.push(v);
+        return out;
+      }
+      return [];
+    },
+    documentElement: { style: {} },
+  };
 
   const [donutCode, prodCode] = await Promise.all([
     fetchScript("/donut.js"),
     fetchScript("/300726c-prod.js"),
   ]);
 
-  const run = (code) => {
-    if (vmCtx !== ctx) {
-      runInContext(code, vmCtx, { timeout: 30000 });
-    } else {
-      new Function(
-        "window",
-        "self",
-        "globalThis",
-        "document",
-        "location",
-        "fetch",
-        "Worker",
-        "addEventListener",
-        "removeEventListener",
-        "dispatchEvent",
-        "navigator",
-        "console",
-        "setTimeout",
-        "setInterval",
-        "clearTimeout",
-        "clearInterval",
-        "Promise",
-        "URL",
-        "URLSearchParams",
-        "WebAssembly",
-        "crypto",
-        "btoa",
-        "atob",
-        "TextEncoder",
-        "TextDecoder",
-        "Uint8Array",
-        "ArrayBuffer",
-        "DataView",
-        "Headers",
-        "Request",
-        "Response",
-        "Blob",
-        "CustomEvent",
-        "Event",
-        "MessageEvent",
-        "JSON",
-        "Math",
-        "Number",
-        "String",
-        "Array",
-        "Object",
-        "Function",
-        "RegExp",
-        "Date",
-        "Map",
-        "Set",
-        "WeakMap",
-        "WeakSet",
-        "Symbol",
-        "Proxy",
-        "Reflect",
-        "Error",
-        "TypeError",
-        "parseInt",
-        "parseFloat",
-        "isNaN",
-        "isFinite",
-        "encodeURIComponent",
-        "decodeURIComponent",
-        "queueMicrotask",
-        "performance",
-        "AbortController",
-        "AbortSignal",
-        code,
-      )(
-        ctx,
-        ctx,
-        ctx,
-        ctx.document,
-        ctx.location,
-        ctx.fetch,
-        ctx.Worker,
-        ctx.addEventListener,
-        ctx.removeEventListener,
-        ctx.dispatchEvent,
-        ctx.navigator,
-        ctx.console,
-        ctx.setTimeout,
-        ctx.setInterval,
-        ctx.clearTimeout,
-        ctx.clearInterval,
-        ctx.Promise,
-        ctx.URL,
-        ctx.URLSearchParams,
-        ctx.WebAssembly,
-        ctx.crypto,
-        ctx.btoa || btoa,
-        ctx.atob || atob,
-        TextEncoder,
-        Uint8Array,
-        ArrayBuffer,
-        DataView,
-        Headers,
-        Request,
-        Response,
-        globalThis.Blob,
-        ctx.CustomEvent,
-        ctx.Event,
-        ctx.MessageEvent,
-        JSON,
-        Math,
-        Number,
-        String,
-        Array,
-        Object,
-        Function,
-        RegExp,
-        Date,
-        Map,
-        Set,
-        WeakMap,
-        WeakSet,
-        Symbol,
-        Proxy,
-        Reflect,
-        Error,
-        TypeError,
-        parseInt,
-        parseFloat,
-        isNaN,
-        isFinite,
-        encodeURIComponent,
-        decodeURIComponent,
-        queueMicrotask,
-        globalThis.performance,
-        AbortController,
-        AbortSignal,
-      );
-    }
-  };
-
-  run(donutCode);
-  await new Promise((r) => setTimeout(r, 200));
+  runCode(donutCode);
+  await new Promise((r) => setTimeout(r, 300));
 
   const csPromise = new Promise((resolve, reject) => {
     const t = setTimeout(() => reject(new Error("_cs timeout")), 20000);
-    ctx.addEventListener("_cs", (ev) => {
+    sandbox.addEventListener("_cs", (ev) => {
       clearTimeout(t);
       resolve(ev?.detail || ev);
     });
   });
 
-  run(prodCode);
+  runCode(prodCode);
 
   let challengeApi;
   try {
     challengeApi = await csPromise;
   } catch {
-    // Fallback: poll for the module on common global names
-    for (let i = 0; i < 50; i++) {
-      await new Promise((r) => setTimeout(r, 200));
-      const candidate =
-        ctx.__cs_module ||
-        ctx._cs_api ||
-        ctx.__cinesrc_challenge ||
-        ctx.__challenge;
-      if (candidate?.gc && candidate?.dr) {
-        challengeApi = candidate;
-        break;
+    for (let i = 0; i < 30; i++) {
+      await new Promise((r) => setTimeout(r, 300));
+      for (const key of Object.keys(sandbox)) {
+        const v = sandbox[key];
+        if (v && typeof v === "object" && typeof v.gc === "function" && typeof v.dr === "function") {
+          challengeApi = v;
+          break;
+        }
       }
+      if (challengeApi) break;
     }
   }
 
   if (!challengeApi?.gc)
-    throw new Error("challenge API not captured from script");
+    throw new Error("challenge API not captured");
 
-  const ss2 = ctx.__ss2_challenge;
+  const ss2 = sandbox.__ss2_challenge;
   if (!ss2?.gc) throw new Error("stage2 challenge not available");
 
   const [tok1, tok2] = await Promise.all([challengeApi.gc(), ss2.gc()]);
@@ -624,20 +358,14 @@ export async function cinesrcExtract(type, tmdbId, season, episode) {
   try {
     const isTV = type !== "movie";
     const encoded = encodeQuery(type, tmdbId, season, episode);
-    const embedPath = isTV
-      ? `/embed/tv/${tmdbId}`
-      : `/embed/movie/${tmdbId}`;
+    const embedPath = isTV ? `/embed/tv/${tmdbId}` : `/embed/movie/${tmdbId}`;
     const searchStr = isTV ? `?s=${season}&e=${episode}` : "";
     const fullPath = embedPath + searchStr;
 
     const { r: rToken, p: pToken } = await callBootstrap(encoded);
 
     const { token: challenge, decrypt } = await solveChallenge(
-      encoded,
-      rToken,
-      pToken,
-      embedPath,
-      searchStr,
+      encoded, rToken, pToken, embedPath, searchStr,
     );
 
     const providers = await callAction(
@@ -656,14 +384,7 @@ export async function cinesrcExtract(type, tmdbId, season, episode) {
     for (const prov of top) {
       try {
         const args = isTV
-          ? [
-              String(tmdbId),
-              "show",
-              String(season),
-              String(episode),
-              challenge,
-              prov.id,
-            ]
+          ? [String(tmdbId), "show", String(season), String(episode), challenge, prov.id]
           : [String(tmdbId), "movie", undefined, undefined, challenge, prov.id];
 
         const raw = await callAction(
@@ -677,9 +398,7 @@ export async function cinesrcExtract(type, tmdbId, season, episode) {
 
         let data;
         if (decrypt) {
-          try {
-            data = await decrypt(raw);
-          } catch {
+          try { data = await decrypt(raw); } catch {
             data = typeof raw === "object" ? raw : null;
           }
         } else {
