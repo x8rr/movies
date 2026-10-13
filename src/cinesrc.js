@@ -1,3 +1,5 @@
+import vm from "node:vm";
+
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 const BASE = "https://cinesrc.st";
@@ -76,71 +78,70 @@ async function callAction(actionId, args, path, headers = {}) {
   return parseServerAction(await resp.text());
 }
 
-class SandboxWorker {
-  constructor(url) {
-    this._cbs = {};
-    this._onmessage = null;
-    this._w = null;
+function makeSandboxWorker(url) {
+  const worker = {
+    _cbs: {},
+    _onmessage: null,
+    _w: null,
+    _ready: null,
+  };
 
-    const self = this;
-    this._ready = (async () => {
-      let scriptUrl =
-        typeof url === "string"
-          ? url.startsWith("/")
-            ? BASE + url
-            : url
-          : url instanceof URL
-            ? url.href
-            : String(url);
+  worker._ready = (async () => {
+    let scriptUrl =
+      typeof url === "string"
+        ? url.startsWith("/")
+          ? BASE + url
+          : url
+        : url instanceof URL
+          ? url.href
+          : String(url);
 
-      let code;
-      if (scriptUrl.startsWith("blob:")) {
-        code = await (await fetch(scriptUrl)).text();
-      } else {
-        code = await fetchScript(scriptUrl);
-      }
+    let code;
+    if (scriptUrl.startsWith("blob:")) {
+      code = await (await fetch(scriptUrl)).text();
+    } else {
+      code = await fetchScript(scriptUrl);
+    }
 
-      const { Worker: W } = await import("node:worker_threads");
-      const shim = [
-        'const{parentPort}=require("worker_threads");',
-        "const self={postMessage:d=>parentPort.postMessage(d),",
-        'addEventListener:(e,fn)=>{if(e==="message")parentPort.on("message",d=>fn({data:d}));}};',
-        "globalThis.self=self;globalThis.postMessage=self.postMessage;",
-        "globalThis.addEventListener=self.addEventListener;globalThis.onmessage=null;",
-        code,
-        'if(typeof globalThis.onmessage==="function")parentPort.on("message",d=>globalThis.onmessage({data:d}));',
-      ].join("\n");
+    const { Worker: W } = await import("node:worker_threads");
+    const shim = [
+      'const{parentPort}=require("worker_threads");',
+      "const self={postMessage:d=>parentPort.postMessage(d),",
+      'addEventListener:(e,fn)=>{if(e==="message")parentPort.on("message",d=>fn({data:d}));}};',
+      "globalThis.self=self;globalThis.postMessage=self.postMessage;",
+      "globalThis.addEventListener=self.addEventListener;globalThis.onmessage=null;",
+      code,
+      'if(typeof globalThis.onmessage==="function")parentPort.on("message",d=>globalThis.onmessage({data:d}));',
+    ].join("\n");
 
-      self._w = new W(shim, { eval: true });
-      self._w.on("message", (data) => {
-        for (const fn of self._cbs.message || []) fn({ data });
-        if (self._onmessage) self._onmessage({ data });
-      });
-      self._w.on("error", (e) => {
-        for (const fn of self._cbs.error || []) fn(e);
-      });
-    })().catch((e) => console.error("[worker init]", e.message));
-  }
-
-  postMessage(data) {
-    this._ready.then(() => {
-      if (this._w) this._w.postMessage(data);
+    worker._w = new W(shim, { eval: true });
+    worker._w.on("message", (data) => {
+      for (const fn of worker._cbs.message || []) fn({ data });
+      if (worker._onmessage) worker._onmessage({ data });
     });
-  }
+    worker._w.on("error", (e) => {
+      for (const fn of worker._cbs.error || []) fn(e);
+    });
+  })().catch((e) => console.error("[cinesrc worker]", e.message));
 
-  addEventListener(type, fn) {
-    (this._cbs[type] ??= []).push(fn);
-  }
-
-  terminate() {
-    this._w?.terminate();
-  }
-
-  set onmessage(fn) { this._onmessage = fn; }
-  get onmessage() { return this._onmessage; }
+  return {
+    postMessage(data) {
+      worker._ready.then(() => {
+        if (worker._w) worker._w.postMessage(data);
+      });
+    },
+    addEventListener(type, fn) {
+      (worker._cbs[type] ??= []).push(fn);
+    },
+    terminate() {
+      worker._w?.terminate();
+    },
+    set onmessage(fn) { worker._onmessage = fn; },
+    get onmessage() { return worker._onmessage; },
+  };
 }
 
-async function solveChallenge(encoded, rToken, pToken, embedPath, searchStr) {
+function buildContext(embedPath, searchStr, encoded, rToken, pToken) {
   const loadedScripts = new Map();
   const eventMap = {};
 
@@ -176,13 +177,20 @@ async function solveChallenge(encoded, rToken, pToken, embedPath, searchStr) {
     return fetch(url, { ...opts, headers: h });
   };
 
-  const sandbox = Object.create(null);
+  // Start with every global from the real runtime
+  const ctx = {};
+  for (const key of Object.getOwnPropertyNames(globalThis)) {
+    try {
+      ctx[key] = globalThis[key];
+    } catch {}
+  }
 
-  sandbox.window = sandbox;
-  sandbox.self = sandbox;
-  sandbox.globalThis = sandbox;
+  // Browser polyfills
+  ctx.window = ctx;
+  ctx.self = ctx;
+  ctx.globalThis = ctx;
 
-  sandbox.location = {
+  ctx.location = {
     pathname: embedPath,
     search: searchStr,
     href: BASE + embedPath + searchStr,
@@ -192,36 +200,43 @@ async function solveChallenge(encoded, rToken, pToken, embedPath, searchStr) {
     protocol: "https:",
     port: "",
     hash: "",
+    replace() {},
+    assign() {},
+    reload() {},
+    toString() { return this.href; },
   };
 
-  sandbox.navigator = { userAgent: UA, language: "en-US", languages: ["en-US"] };
-  sandbox.fetch = patchedFetch;
-  sandbox.Worker = SandboxWorker;
-  sandbox.__ss2_challenge = null;
+  ctx.navigator = { userAgent: UA, language: "en-US", languages: ["en-US"] };
+  ctx.fetch = patchedFetch;
+  ctx.Worker = function WorkerShim(url) { return makeSandboxWorker(url); };
+  ctx.__ss2_challenge = null;
 
-  sandbox.addEventListener = (type, fn) => {
+  ctx.addEventListener = (type, fn) => {
     (eventMap[type] ??= []).push(fn);
   };
-  sandbox.removeEventListener = (type, fn) => {
+  ctx.removeEventListener = (type, fn) => {
     if (eventMap[type]) eventMap[type] = eventMap[type].filter((f) => f !== fn);
   };
-  sandbox.dispatchEvent = (ev) => {
+  ctx.dispatchEvent = (ev) => {
     const t = ev?.type || ev;
     for (const fn of eventMap[t] || []) {
-      try { fn(ev); } catch {}
+      try { fn(ev); } catch (e) { console.error("[cinesrc event]", e.message); }
     }
     return true;
   };
 
-  sandbox.CustomEvent = class CustomEvent {
+  ctx.CustomEvent = class CustomEvent {
     constructor(type, opts = {}) {
       this.type = type;
       this.detail = opts.detail ?? null;
     }
   };
-  sandbox.Event = class SEvent {
+  ctx.Event = class SEvent {
     constructor(type) { this.type = type; }
   };
+
+  let vmCtx;
+  const runCode = (code) => vm.runInContext(code, vmCtx, { timeout: 30000 });
 
   const makeScriptEl = () => {
     const el = {
@@ -249,12 +264,7 @@ async function solveChallenge(encoded, rToken, pToken, embedPath, searchStr) {
     return el;
   };
 
-  const runCode = (code) => {
-    const fn = new Function("sandbox", `with(sandbox){${code}\n}`);
-    fn(sandbox);
-  };
-
-  sandbox.document = {
+  ctx.document = {
     createElement(tag) {
       if (tag === "script") return makeScriptEl();
       if (tag === "link")
@@ -271,7 +281,7 @@ async function solveChallenge(encoded, rToken, pToken, embedPath, searchStr) {
           fetchScript(url)
             .then((code) => {
               try { runCode(code); } catch (e) {
-                console.error("[cinesrc sandbox]", src, e.message);
+                console.error("[cinesrc eval]", src, e.message);
               }
               el._fire("load");
             })
@@ -285,7 +295,7 @@ async function solveChallenge(encoded, rToken, pToken, embedPath, searchStr) {
         return el;
       },
     },
-    body: { appendChild(el) { return sandbox.document.head.appendChild(el); } },
+    body: { appendChild(el) { return ctx.document.head.appendChild(el); } },
     querySelector(sel) {
       const m = sel.match(/script\[data-src(?:\^)?="([^"]+)"\]/);
       if (m) {
@@ -305,6 +315,15 @@ async function solveChallenge(encoded, rToken, pToken, embedPath, searchStr) {
     documentElement: { style: {} },
   };
 
+  vmCtx = vm.createContext(ctx);
+  return { ctx, vmCtx, runCode };
+}
+
+async function solveChallenge(encoded, rToken, pToken, embedPath, searchStr) {
+  const { ctx, vmCtx, runCode } = buildContext(
+    embedPath, searchStr, encoded, rToken, pToken,
+  );
+
   const [donutCode, prodCode] = await Promise.all([
     fetchScript("/donut.js"),
     fetchScript("/300726c-prod.js"),
@@ -315,7 +334,7 @@ async function solveChallenge(encoded, rToken, pToken, embedPath, searchStr) {
 
   const csPromise = new Promise((resolve, reject) => {
     const t = setTimeout(() => reject(new Error("_cs timeout")), 20000);
-    sandbox.addEventListener("_cs", (ev) => {
+    ctx.addEventListener("_cs", (ev) => {
       clearTimeout(t);
       resolve(ev?.detail || ev);
     });
@@ -327,10 +346,11 @@ async function solveChallenge(encoded, rToken, pToken, embedPath, searchStr) {
   try {
     challengeApi = await csPromise;
   } catch {
+    // Fallback: scan context for the module
     for (let i = 0; i < 30; i++) {
       await new Promise((r) => setTimeout(r, 300));
-      for (const key of Object.keys(sandbox)) {
-        const v = sandbox[key];
+      for (const key of Object.keys(ctx)) {
+        const v = ctx[key];
         if (v && typeof v === "object" && typeof v.gc === "function" && typeof v.dr === "function") {
           challengeApi = v;
           break;
@@ -343,7 +363,7 @@ async function solveChallenge(encoded, rToken, pToken, embedPath, searchStr) {
   if (!challengeApi?.gc)
     throw new Error("challenge API not captured");
 
-  const ss2 = sandbox.__ss2_challenge;
+  const ss2 = ctx.__ss2_challenge;
   if (!ss2?.gc) throw new Error("stage2 challenge not available");
 
   const [tok1, tok2] = await Promise.all([challengeApi.gc(), ss2.gc()]);
