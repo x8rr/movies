@@ -165,12 +165,11 @@ async function collectStreams(customPromise, pstreamPromise) {
 
 router.get("/stream/movie/:tmdbId", async (req, res) => {
   try {
-    const streams = await collectStreams(
-      scrapeAll("movie", req.params.tmdbId),
-      buildMovieMedia(req.params.tmdbId).then((m) =>
-        scrapeWithEvents(m).then(({ result }) => pstreamToStreams(result)),
-      ),
+    const customP = scrapeAll("movie", req.params.tmdbId);
+    const pstreamP = buildMovieMedia(req.params.tmdbId).then((m) =>
+      scrapeWithEvents(m).then(({ result }) => pstreamToStreams(result)),
     );
+    const streams = await collectStreams(customP, pstreamP);
     res.json({ streams });
   } catch (e) {
     res.status(500).json({ error: e.message });

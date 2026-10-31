@@ -24,18 +24,84 @@ const JS_BUILTINS = new Set([
 ]);
 
 const scriptCache = new Map();
+let _siteConfig = null;
+let _configExpiry = 0;
 
-async function fetchScript(path) {
+function extractCookies(resp) {
+  return (resp.headers.getSetCookie?.() || [])
+    .map((c) => c.split(";")[0].trim())
+    .filter(Boolean)
+    .join("; ");
+}
+
+function mergeCookies(existing, fresh) {
+  if (!fresh) return existing || "";
+  if (!existing) return fresh;
+  const map = new Map();
+  for (const part of (existing + "; " + fresh).split("; ")) {
+    const eq = part.indexOf("=");
+    if (eq > 0) map.set(part.slice(0, eq), part);
+  }
+  return [...map.values()].join("; ");
+}
+
+async function fetchWithCookies(url, opts = {}, cookies) {
+  const h = { "User-Agent": UA, Referer: BASE + "/", ...opts.headers };
+  if (cookies) h.Cookie = cookies;
+  return fetch(url.startsWith("/") ? BASE + url : url, { ...opts, headers: h });
+}
+
+async function fetchScript(path, cookies) {
   const url = path.startsWith("http") ? path : BASE + path;
-  if (!scriptCache.has(url)) {
+  const key = url;
+  if (!scriptCache.has(key)) {
     scriptCache.set(
-      url,
-      fetch(url, { headers: { "User-Agent": UA, Referer: BASE + "/" } }).then(
-        (r) => r.text(),
-      ),
+      key,
+      fetchWithCookies(url, {}, cookies).then((r) => r.text()),
     );
   }
-  return scriptCache.get(url);
+  return scriptCache.get(key);
+}
+
+async function discoverConfig() {
+  if (_siteConfig && Date.now() < _configExpiry) return _siteConfig;
+
+  const resp = await fetchWithCookies(BASE + "/embed/movie/0");
+  const html = await resp.text();
+
+  const chunkUrls = [...html.matchAll(/src="(\/_next\/static\/chunks\/[^"]+)"/g)].map((m) => m[1]);
+
+  let assetConfig = null;
+  let providerListActionId = null;
+  let getStreamActionId = null;
+
+  for (const chunkUrl of chunkUrls) {
+    const code = await fetchScript(chunkUrl);
+
+    if (!assetConfig) {
+      const m = code.match(/assets:\{client:"([^"]+)",worker:"([^"]+)",wasm:"([^"]+)"\}/);
+      if (m) assetConfig = { client: m[1], worker: m[2], wasm: m[3] };
+    }
+
+    if (!providerListActionId) {
+      const m = code.match(/createServerReference\)\("([a-f0-9]+)"[^)]*?"getProviderList"\)/);
+      if (m) providerListActionId = m[1];
+    }
+    if (!getStreamActionId) {
+      const m = code.match(/createServerReference\)\("([a-f0-9]+)"[^)]*?"getStream"\)/);
+      if (m) getStreamActionId = m[1];
+    }
+
+    if (assetConfig && providerListActionId && getStreamActionId) break;
+  }
+
+  if (!assetConfig) throw new Error("could not discover asset config");
+  if (!providerListActionId || !getStreamActionId) throw new Error("could not discover action IDs");
+
+  _siteConfig = { assets: assetConfig, providerListActionId, getStreamActionId };
+  _configExpiry = Date.now() + 3600_000;
+  scriptCache.clear();
+  return _siteConfig;
 }
 
 function encodeQuery(type, tmdbId, season, episode) {
@@ -55,13 +121,20 @@ function encodeQuery(type, tmdbId, season, episode) {
     .replace(/=+$/, "");
 }
 
-async function callBootstrap(encoded) {
+async function callBootstrap(encoded, cookies) {
   const resp = await fetch(BASE + "/api/c/bootstrap", {
     method: "POST",
-    headers: { "User-Agent": UA, Referer: BASE + "/", "x-cs-q": encoded },
+    headers: {
+      "User-Agent": UA,
+      Referer: BASE + "/",
+      "x-cs-q": encoded,
+      ...(cookies ? { Cookie: cookies } : {}),
+    },
   });
   if (!resp.ok) throw new Error("bootstrap " + resp.status);
-  return resp.json();
+  const fresh = extractCookies(resp);
+  const data = await resp.json();
+  return { ...data, _cookies: mergeCookies(cookies, fresh) };
 }
 
 function parseServerAction(text) {
@@ -81,23 +154,25 @@ function parseServerAction(text) {
   return null;
 }
 
-async function callAction(actionId, args, path, headers = {}) {
+async function callAction(actionId, args, path, headers = {}, cookies) {
+  const h = {
+    "User-Agent": UA,
+    Referer: BASE + path,
+    "Next-Action": actionId,
+    "Content-Type": "text/plain;charset=UTF-8",
+    ...headers,
+  };
+  if (cookies) h.Cookie = cookies;
   const resp = await fetch(BASE + path, {
     method: "POST",
-    headers: {
-      "User-Agent": UA,
-      Referer: BASE + path,
-      "Next-Action": actionId,
-      "Content-Type": "text/plain;charset=UTF-8",
-      ...headers,
-    },
+    headers: h,
     body: JSON.stringify(args),
   });
   if (!resp.ok) throw new Error("action " + resp.status);
   return parseServerAction(await resp.text());
 }
 
-function makeSandboxWorker(url, blobStore, parentFetch) {
+function makeSandboxWorker(url, blobStore, parentFetch, cookies) {
   const messageCbs = [];
   let onmessageFn = null;
   let workerOnmessage = null;
@@ -130,6 +205,7 @@ function makeSandboxWorker(url, blobStore, parentFetch) {
     const opts = typeof args[1] === "object" ? { ...args[1] } : {};
     const h = new Headers(opts.headers);
     if (!h.has("User-Agent")) h.set("User-Agent", UA);
+    if (cookies && !h.has("Cookie")) h.set("Cookie", cookies);
     return fetch(u, { ...opts, headers: h });
   };
 
@@ -143,7 +219,7 @@ function makeSandboxWorker(url, blobStore, parentFetch) {
   } else if (scriptUrl.startsWith("blob:")) {
     codePromise = Promise.reject(new Error("blob URL not in store"));
   } else {
-    codePromise = fetchScript(scriptUrl);
+    codePromise = fetchScript(scriptUrl, cookies);
   }
 
   const readyPromise = codePromise.then(async (code) => {
@@ -197,7 +273,7 @@ function makeSandboxWorker(url, blobStore, parentFetch) {
   };
 }
 
-function buildContext(embedPath, searchStr, encoded, rToken, pToken) {
+function buildContext(embedPath, searchStr, encoded, rToken, pToken, cookies) {
   const loadedScripts = new Map();
   const fullUrl = BASE + embedPath + searchStr;
 
@@ -226,12 +302,14 @@ function buildContext(embedPath, searchStr, encoded, rToken, pToken) {
       if (parsed.pathname === "/api/c/issue") h.set("x-cs-p", pToken);
       h.set("User-Agent", UA);
       h.set("Referer", fullUrl);
+      if (cookies) h.set("Cookie", cookies);
       return fetch(url, { ...opts, headers: h });
     }
 
     const h = new Headers(opts.headers);
     if (!h.has("User-Agent")) h.set("User-Agent", UA);
     if (!h.has("Referer")) h.set("Referer", BASE + "/");
+    if (cookies && !h.has("Cookie")) h.set("Cookie", cookies);
     return fetch(url, { ...opts, headers: h });
   };
 
@@ -283,7 +361,7 @@ function buildContext(embedPath, searchStr, encoded, rToken, pToken) {
     return id;
   };
   ctx.URL.revokeObjectURL = (url) => blobStore.delete(url);
-  ctx.Worker = function WorkerShim(url) { return makeSandboxWorker(url, blobStore, patchedFetch); };
+  ctx.Worker = function WorkerShim(url) { return makeSandboxWorker(url, blobStore, patchedFetch, cookies); };
 
   let vmCtx;
   const runCode = (code) => vm.runInContext(code, vmCtx, { timeout: 30000 });
@@ -324,7 +402,7 @@ function buildContext(embedPath, searchStr, encoded, rToken, pToken) {
       if (src) {
         loadedScripts.set(src, child);
         const url = src.startsWith("/") ? BASE + src : src;
-        fetchScript(url)
+        fetchScript(url, cookies)
           .then((code) => {
             try { runCode(code); } catch (e) {
               console.error("[cinesrc eval]", src, e.message);
@@ -398,14 +476,14 @@ function buildContext(embedPath, searchStr, encoded, rToken, pToken) {
   return { ctx, vmCtx, runCode, win };
 }
 
-async function solveChallenge(encoded, rToken, pToken, embedPath, searchStr) {
+async function solveChallenge(config, encoded, rToken, pToken, embedPath, searchStr, cookies) {
   const { ctx, vmCtx, runCode, win } = buildContext(
-    embedPath, searchStr, encoded, rToken, pToken,
+    embedPath, searchStr, encoded, rToken, pToken, cookies,
   );
 
-  const [donutCode, prodCode] = await Promise.all([
-    fetchScript("/donut.js"),
-    fetchScript("/300726c-prod.js"),
+  const [donutCode, clientCode] = await Promise.all([
+    fetchScript("/donut.js", cookies),
+    fetchScript(config.assets.client, cookies),
   ]);
 
   runCode(donutCode);
@@ -418,14 +496,14 @@ async function solveChallenge(encoded, rToken, pToken, embedPath, searchStr) {
     });
   `);
 
-  runCode(prodCode);
+  runCode(clientCode);
 
   await new Promise((r) => setTimeout(r, 500));
 
   let challengeApi = vmCtx.__csApi;
 
   if (!challengeApi?.gc) {
-    for (let i = 0; i < 20; i++) {
+    for (let i = 0; i < 30; i++) {
       await new Promise((r) => setTimeout(r, 500));
       challengeApi = vmCtx.__csApi;
       if (challengeApi?.gc) break;
@@ -442,8 +520,9 @@ async function solveChallenge(encoded, rToken, pToken, embedPath, searchStr) {
     }
   }
 
-  if (!challengeApi?.gc)
+  if (!challengeApi?.gc) {
     throw new Error("challenge API not captured");
+  }
 
   const ss2 = vmCtx.__ss2_challenge;
   if (!ss2?.gc) throw new Error("stage2 challenge not available");
@@ -460,29 +539,32 @@ async function solveChallenge(encoded, rToken, pToken, embedPath, searchStr) {
 
 export async function cinesrcExtract(type, tmdbId, season, episode) {
   try {
+    const config = await discoverConfig();
     const isTV = type !== "movie";
     const encoded = encodeQuery(type, tmdbId, season, episode);
     const embedPath = isTV ? `/embed/tv/${tmdbId}` : `/embed/movie/${tmdbId}`;
     const searchStr = isTV ? `?s=${season}&e=${episode}` : "";
     const fullPath = embedPath + searchStr;
 
-    const { r: rToken, p: pToken } = await callBootstrap(encoded);
+    const { r: rToken, p: pToken, _cookies: cookies } = await callBootstrap(encoded);
 
     const { token: challenge, decrypt } = await solveChallenge(
-      encoded, rToken, pToken, embedPath, searchStr,
+      config, encoded, rToken, pToken, embedPath, searchStr, cookies,
     );
 
     const providers = await callAction(
-      "00709a44ddb018c921339ab3213396ad85c0dc0237",
+      config.providerListActionId,
       [],
       fullPath,
+      {},
+      cookies,
     );
 
     if (!Array.isArray(providers) || !providers.length) return [];
 
     const top = providers
       .sort((a, b) => (b.rank || 0) - (a.rank || 0))
-      .slice(0, 3);
+      .slice(0, 1);
 
     const results = [];
     for (const prov of top) {
@@ -492,10 +574,11 @@ export async function cinesrcExtract(type, tmdbId, season, episode) {
           : [String(tmdbId), "movie", undefined, undefined, challenge, prov.id];
 
         const raw = await callAction(
-          "7e278c7b1a4440a99a81b5c121b5f93193ce0a3f64",
+          config.getStreamActionId,
           args,
           fullPath,
           { "x-cs-r": rToken, "x-cs-q": encoded, "x-cs-p": pToken },
+          cookies,
         );
 
         if (!raw || raw === "e1:invalid_challenge") continue;
