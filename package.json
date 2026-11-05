@@ -12,7 +12,6 @@
     "@p-stream/providers": "github:movie-web-rip/pstream-providers#production",
     "cors": "^2.8.5",
     "express": "^5.1.0",
-    "happy-dom": "^21.0.1",
-    "libsodium-wrappers-sumo": "0.7.15"
+    "happy-dom": "^21.0.1"
   }
 }
