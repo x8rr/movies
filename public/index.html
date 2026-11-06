@@ -62,6 +62,7 @@
     }
     .server-btn:hover { background: #222; color: #ccc; }
     .server-btn.active { background: #e50914; border-color: #e50914; color: #fff; }
+    .server-btn.dead { opacity: 0.4; text-decoration: line-through; }
 
     .player-content { flex: 1; position: relative; background: #000; }
     .player-content video { width: 100%; height: 100%; background: #000; }
@@ -155,6 +156,8 @@ const IMG = 'https://image.tmdb.org/t/p';
 
 let searchTimer;
 let currentStreams = [];
+let currentPath = null;
+let refetched = false;
 const searchInput = document.getElementById('searchInput');
 searchInput.addEventListener('input', () => {
   clearTimeout(searchTimer);
@@ -269,59 +272,101 @@ function cleanupPlayer() {
   if (video._hls) { video._hls.destroy(); video._hls = null; }
 }
 
-function proxyUrl(url) {
-  return API + '/api/proxy?url=' + encodeURIComponent(url);
+function proxyUrl(stream) {
+  let u = API + '/api/proxy?url=' + encodeURIComponent(stream.url);
+  if (stream.headers) u += '&headers=' + encodeURIComponent(JSON.stringify(stream.headers));
+  return u;
 }
 
-function playStream(stream, idx) {
+let playToken = 0;
+
+function playStream(stream, idx, auto = false) {
   cleanupPlayer();
   const video = document.getElementById('videoPlayer');
   const status = document.getElementById('playerStatus');
+  const token = ++playToken;
 
   document.querySelectorAll('.server-btn').forEach(b => b.classList.remove('active'));
   const btn = document.querySelector(`.server-btn[data-idx="${idx}"]`);
   if (btn) btn.classList.add('active');
 
+  // on failure (or no playback within 15s), move on to the next server
+  let failed = false;
+  const fail = () => {
+    if (failed || token !== playToken) return;
+    failed = true;
+    clearTimeout(stall);
+    stream.dead = true;
+    if (btn) btn.classList.add('dead');
+    const next = idx + 1;
+    if (auto && next < currentStreams.length) {
+      status.textContent = `${stream.providerName} failed — trying next server...`;
+      playStream(currentStreams[next], next, true);
+    } else if (auto && !refetched) {
+      // slower providers finish after the first response; pick them up
+      refetched = true;
+      status.textContent = 'looking for more servers...';
+      const path = currentPath;
+      api(path).then((data) => {
+        if (token !== playToken || path !== currentPath) return;
+        const known = new Set(currentStreams.map(s => s.url));
+        const fresh = (data.streams || []).filter(s => !known.has(s.url));
+        if (!fresh.length) { status.textContent = 'all servers failed'; return; }
+        renderServerBar([...currentStreams, ...fresh]);
+        playStream(currentStreams[next], next, true);
+      }).catch(() => { status.textContent = 'all servers failed'; });
+    } else {
+      status.textContent = 'stream error — try another server';
+    }
+  };
+  const stall = setTimeout(fail, 15000);
+  video.addEventListener('playing', () => { clearTimeout(stall); status.textContent = ''; }, { once: true });
+  video.addEventListener('error', fail, { once: true });
+
   if (stream.type === 'hls') {
-    const src = proxyUrl(stream.url);
+    const src = proxyUrl(stream);
     if (Hls.isSupported()) {
       const hls = new Hls();
       hls.loadSource(src);
       hls.attachMedia(video);
-      hls.on(Hls.Events.MANIFEST_PARSED, () => { video.play(); status.textContent = ''; });
-      hls.on(Hls.Events.ERROR, (_e, data) => {
-        if (data.fatal) status.textContent = 'stream error — try another server';
-      });
+      hls.on(Hls.Events.MANIFEST_PARSED, () => { video.play().catch(() => {}); });
+      hls.on(Hls.Events.ERROR, (_e, data) => { if (data.fatal) fail(); });
       video._hls = hls;
     } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
       video.src = src;
-      video.play();
+      video.play().catch(() => {});
     }
-    status.textContent = 'loading...';
   } else {
-    video.src = proxyUrl(stream.url);
-    video.play();
-    status.textContent = '';
+    video.src = proxyUrl(stream);
+    video.play().catch(() => {});
   }
+  status.textContent = 'loading...';
+}
+
+function qualityNum(s) {
+  return parseInt(s.quality) || 0;
 }
 
 function renderServerBar(streams) {
   const bar = document.getElementById('serverBar');
-  const seen = new Map();
+  const best = new Map();
 
-  // Dedupe by provider, keep first (best) per provider
-  const unique = [];
+  // One button per server, keeping its highest quality; unlabeled mirrors stay separate
   for (const s of streams) {
-    const key = s.provider + ':' + s.type;
-    if (!seen.has(key)) {
-      seen.set(key, true);
-      unique.push(s);
-    }
+    const key = s.providerName + ':' + s.type + (s.quality ? '' : ':' + s.url);
+    const cur = best.get(key);
+    if (!cur || qualityNum(s) > qualityNum(cur)) best.set(key, s);
+  }
+  const unique = [...best.values()];
+  const count = {};
+  for (const s of unique) {
+    count[s.providerName] = (count[s.providerName] || 0) + 1;
+    s.label = s.providerName + (count[s.providerName] > 1 ? ' ' + count[s.providerName] : '');
   }
 
   currentStreams = unique;
   bar.innerHTML = unique.map((s, i) =>
-    `<button class="server-btn${i === 0 ? ' active' : ''}" data-idx="${i}" onclick="playStream(currentStreams[${i}], ${i})">${s.providerName}${s.quality ? ' ' + s.quality : ''}</button>`
+    `<button class="server-btn${i === 0 ? ' active' : ''}${s.dead ? ' dead' : ''}" data-idx="${i}" onclick="playStream(currentStreams[${i}], ${i})">${s.label}${s.quality ? ' ' + s.quality : ''}</button>`
   ).join('');
 }
 
@@ -339,6 +384,8 @@ async function watchContent(id, type, title, season, episode) {
   const path = type === 'movie'
     ? `/api/stream/movie/${id}`
     : `/api/stream/tv/${id}/${season}/${episode}`;
+  currentPath = path;
+  refetched = false;
 
   try {
     const data = await api(path);
@@ -350,7 +397,7 @@ async function watchContent(id, type, title, season, episode) {
     }
 
     renderServerBar(streams);
-    playStream(currentStreams[0], 0);
+    playStream(currentStreams[0], 0, true);
   } catch (e) {
     status.textContent = 'error: ' + e.message;
   }

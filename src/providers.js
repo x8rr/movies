@@ -1,4 +1,13 @@
 import { cinesrcExtract } from "./cinesrc.js";
+import { vidsparkExtract } from "./vidspark.js";
+import { vixsrcExtract } from "./vixsrc.js";
+import { vidzeeExtract } from "./vidzee.js";
+import { vidrockExtract } from "./vidrock.js";
+import { twoembedExtract } from "./twoembed.js";
+import { vidfastExtract } from "./vidfast.js";
+import { vidcoreExtract } from "./vidcore.js";
+import { vidupExtract } from "./vidup.js";
+import { vidnestExtract } from "./vidnest.js";
 
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
@@ -61,7 +70,13 @@ async function vidsrcExtract(type, tmdbId, season, episode) {
       `https://vidsrc.sh/vs_src.php?type=${isTV ? "tv" : "movie"}&id=${srcPath}`,
       "https://vidsrc.sh/",
     );
-    const { src } = await apiResp.json();
+    const srcText = await apiResp.text();
+    let src;
+    try {
+      ({ src } = JSON.parse(srcText));
+    } catch {
+      throw new Error(`vs_src ${apiResp.status} returned non-JSON`);
+    }
     if (!src) return [];
 
     const landResp = await vidsrcFetch(src, "https://vidsrc.sh/");
@@ -76,6 +91,7 @@ async function vidsrcExtract(type, tmdbId, season, episode) {
     const configMatch = playerHtml.match(/window\.CONFIG\s*=\s*(\{.*?\});/s);
     if (!configMatch) return [];
     const config = JSON.parse(configMatch[1]);
+    if (config.rateLimited) throw new Error("rate limited");
     if (!config.apiToken) return [];
 
     let streamApiUrl;
@@ -145,16 +161,113 @@ async function vidsrcExtract(type, tmdbId, season, episode) {
   }
 }
 
+// a single slow provider must not hold up the response
+const PROVIDER_TIMEOUT = 15000;
+// once something is found, wait this much longer for the rest
+const GRACE_AFTER_FIRST = 6000;
+const HARD_DEADLINE = 18000;
+const CHECK_TIMEOUT = 5000;
+
+function firstNonEmpty(...extractors) {
+  return async (...args) => {
+    for (const extract of extractors) {
+      const streams = await extract(...args);
+      if (streams.length) return streams;
+    }
+    return [];
+  };
+}
+
 const PROVIDERS = [
   { id: "vidsrc", name: "VidSrc", extract: vidsrcExtract },
   { id: "cinesrc", name: "CineSrc", extract: cinesrcExtract },
+  { id: "vidspark", name: "VidSpark", extract: vidsparkExtract },
+  { id: "vixsrc", name: "VixSrc", extract: vixsrcExtract },
+  { id: "vidzee", name: "VidZee", extract: vidzeeExtract },
+  { id: "vidrock", name: "VidRock", extract: vidrockExtract },
+  { id: "twoembed", name: "2Embed", extract: twoembedExtract },
+  { id: "vidnest", name: "VidNest", extract: vidnestExtract },
+  // vidfast/vidcore/vidup are one backend behind three domains, each needing a
+  // ~150MB sandbox — try them one at a time so a rate limit on one isn't fatal
+  {
+    id: "vidfast",
+    name: "VidFast",
+    extract: firstNonEmpty(vidfastExtract, vidcoreExtract, vidupExtract),
+    timeout: HARD_DEADLINE,
+  },
 ];
 
-export async function scrapeAll(type, tmdbId, season, episode) {
-  const results = await Promise.allSettled(
-    PROVIDERS.map((p) => p.extract(type, tmdbId, season, episode)),
+
+function withTimeout(promise, ms) {
+  let timer;
+  return Promise.race([
+    promise,
+    new Promise((r) => (timer = setTimeout(() => r([]), ms))),
+  ]).finally(() => clearTimeout(timer));
+}
+
+async function isAlive(stream) {
+  const headers = {
+    "User-Agent": UA,
+    Referer: new URL(stream.url).origin + "/",
+    ...(stream.headers || {}),
+  };
+  try {
+    if (stream.type === "hls") {
+      const r = await fetch(stream.url, { headers, signal: AbortSignal.timeout(CHECK_TIMEOUT) });
+      return r.ok && (await r.text()).trimStart().startsWith("#EXTM3U");
+    }
+    const r = await fetch(stream.url, {
+      headers: { ...headers, Range: "bytes=0-0" },
+      signal: AbortSignal.timeout(CHECK_TIMEOUT),
+    });
+    r.body?.cancel();
+    return r.ok;
+  } catch {
+    return false;
+  }
+}
+
+async function checkStreams(streams) {
+  const alive = await Promise.all(streams.map(isAlive));
+  return streams.filter((_, i) => alive[i]);
+}
+
+// tasks: [{ id, extract }] — runs all in parallel, returns live streams in task order.
+// Returns early once the grace window passes; onSettled gets the full set when
+// the stragglers finish.
+export async function scrapeAll(type, tmdbId, season, episode, tasks = PROVIDERS, onSettled) {
+  const slots = tasks.map(() => null);
+  const pending = tasks.map((p, i) =>
+    withTimeout(
+      Promise.resolve()
+        .then(() => p.extract(type, tmdbId, season, episode))
+        .then(checkStreams)
+        .catch(() => []),
+      p.timeout ?? PROVIDER_TIMEOUT,
+    ).then((s) => (slots[i] = s)),
   );
-  return results.flatMap((r) => (r.status === "fulfilled" ? r.value : []));
+
+  const collect = () => slots.flatMap((s) => s || []);
+  if (onSettled) Promise.all(pending).then(() => onSettled(collect()));
+
+  await new Promise((resolve) => {
+    let grace = null;
+    const hard = setTimeout(resolve, HARD_DEADLINE);
+    const done = () => {
+      clearTimeout(hard);
+      clearTimeout(grace);
+      resolve();
+    };
+    Promise.all(pending).then(done);
+    for (const p of pending) {
+      p.then((s) => {
+        if (s.length && !grace) grace = setTimeout(done, GRACE_AFTER_FIRST);
+      });
+    }
+  });
+
+  return collect();
 }
 
 export { PROVIDERS };
