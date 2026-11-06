@@ -1,15 +1,22 @@
 import crypto from "node:crypto";
+import { RotatingKey, fetchPageScripts, stringLiterals } from "./keys.js";
 
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 const BASE = "https://vidrock.net";
 const PLAY_HEADERS = { Referer: BASE + "/", Origin: BASE };
-const KEY = Buffer.from("7f3e9c2a8b5d1f4e6a9c3b7d2e5f8a1c4b6d9e2f5a8c1b4d7e9f2a5c8b1d4e7f", "hex");
+// AES-256-GCM key from the player bundle, kept as a hex string literal there.
+const KEY = new RotatingKey({
+  name: "vidrock",
+  env: "VIDROCK_KEY",
+  fallback: "7f3e9c2a8b5d1f4e6a9c3b7d2e5f8a1c4b6d9e2f5a8c1b4d7e9f2a5c8b1d4e7f",
+  discover: async () => (await fetchPageScripts(BASE + "/movie/550")).flatMap((c) => stringLiterals(c, "[0-9a-fA-F]{64}")),
+});
 
-function decryptUrl(enc) {
+function decryptUrl(enc, hexKey) {
   const buf = Buffer.from(enc, "base64url");
   if (buf.length < 28) throw new Error("ciphertext too short");
-  const decipher = crypto.createDecipheriv("aes-256-gcm", KEY, buf.subarray(0, 12));
+  const decipher = crypto.createDecipheriv("aes-256-gcm", Buffer.from(hexKey, "hex"), buf.subarray(0, 12));
   decipher.setAuthTag(buf.subarray(buf.length - 16));
   return Buffer.concat([decipher.update(buf.subarray(12, buf.length - 16)), decipher.final()]).toString("utf8");
 }
@@ -50,7 +57,7 @@ export async function vidrockExtract(type, tmdbId, season, episode) {
         if (!src?.url) return [];
         let url;
         try {
-          url = decryptUrl(src.url);
+          url = await KEY.use((k) => decryptUrl(src.url, k));
         } catch {
           return [];
         }

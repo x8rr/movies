@@ -1,9 +1,22 @@
+import { RotatingKey, fetchPageScripts, stringLiterals } from "./keys.js";
+
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 const SITE = "https://vidnest.fun";
 const API = "https://new.vidnest.fun";
-// Key baked into the vidnest.fun player bundle (module "decryptCipherResponse").
-const SECRET = "K3p8vQ2mX9rL5wZ0fN7bG1sH4tJ6dC9_y8S3wM1nQ5pL2";
+// Key baked into the vidnest.fun player bundle (module "decryptCipherResponse"), declared
+// right before the API host literal. Other token-like literals are tried after that one.
+const SECRET = new RotatingKey({
+  name: "vidnest",
+  env: "VIDNEST_SECRET",
+  fallback: "K3p8vQ2mX9rL5wZ0fN7bG1sH4tJ6dC9_y8S3wM1nQ5pL2",
+  discover: async () => {
+    const code = (await fetchPageScripts(SITE + "/movie/550")).join("\n");
+    const host = API.replace(/[.\/]/g, "\\$&");
+    const near = [...code.matchAll(new RegExp(`=["'\`]([^"'\`]{16,128})["'\`],\\w+=["'\`]${host}["'\`]`, "g"))].map((m) => m[1]);
+    return [...near, ...stringLiterals(code, "[A-Za-z0-9_-]{32,64}")];
+  },
+});
 // Alfa returns relative "/hls/..." paths that the player prefixes with one of these.
 const ALFA_HOSTS = [
   "https://long-night-d802.streamed-5.workers.dev",
@@ -16,7 +29,7 @@ const ALFA_HOSTS = [
 const TIMEOUT = 12000;
 
 // server key -> backend path segment (the "hexa" server is a VidLink proxy; skipped,
-// the project already has src/vidlink.js).
+// VidLink is Cloudflare-blocked for us).
 const SERVERS = {
   catflix: "yflix",
   filxer: "rogflix",
@@ -39,10 +52,12 @@ function b64url(s) {
 
 async function decrypt(j) {
   if (!(j && j.v === 2 && j.d)) return j;
-  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(`${j.n}|${SECRET}`));
-  const key = await crypto.subtle.importKey("raw", digest, "AES-GCM", false, ["decrypt"]);
   const buf = b64url(j.d);
-  const out = await crypto.subtle.decrypt({ name: "AES-GCM", iv: buf.subarray(0, 12) }, key, buf.subarray(12));
+  const out = await SECRET.use(async (secret) => {
+    const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(`${j.n}|${secret}`));
+    const key = await crypto.subtle.importKey("raw", digest, "AES-GCM", false, ["decrypt"]);
+    return crypto.subtle.decrypt({ name: "AES-GCM", iv: buf.subarray(0, 12) }, key, buf.subarray(12));
+  });
   const text = new TextDecoder().decode(out);
   try {
     return JSON.parse(text);
