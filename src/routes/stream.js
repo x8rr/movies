@@ -1,7 +1,7 @@
 import { Router } from "express";
 import { Readable } from "stream";
 import { tmdb } from "../tmdb.js";
-import { PROVIDERS, scrapeAll } from "../providers.js";
+import { PROVIDERS, childUrl, scrapeAll, upstreamHeaders } from "../providers.js";
 import { listPstream, pstreamTasks } from "../pstream.js";
 
 const router = Router();
@@ -96,12 +96,16 @@ const BLOCKED_HEADERS = new Set(["host", "content-length", "connection", "range"
 const PASS_HEADERS = ["content-type", "content-length", "content-range", "accept-ranges"];
 const MAX_CHUNK = 8 * 1024 * 1024;
 
+// A stream's `headers` are sent on every upstream request; a null value removes a
+// default header instead (some CDNs reject any Referer at all).
 function parseHeaders(raw) {
   if (!raw) return {};
   try {
     const h = JSON.parse(raw);
     return Object.fromEntries(
-      Object.entries(h).filter(([k, v]) => typeof v === "string" && !BLOCKED_HEADERS.has(k.toLowerCase())),
+      Object.entries(h).filter(
+        ([k, v]) => (typeof v === "string" || v === null) && !BLOCKED_HEADERS.has(k.toLowerCase()),
+      ),
     );
   } catch {
     return {};
@@ -117,9 +121,7 @@ router.get("/proxy", async (req, res) => {
   res.on("close", () => ac.abort());
 
   try {
-    const origin = new URL(url).origin;
-    const extra = parseHeaders(req.query.headers);
-    const headers = { "User-Agent": UA, Referer: origin + "/", ...extra };
+    const headers = upstreamHeaders(url, parseHeaders(req.query.headers));
     // Bun's fetch buffers bodies without backpressure, so an open-ended range on a
     // multi-GB mp4 would pull the whole file into RAM — serve it in bounded chunks
     const range = req.headers.range?.match(/^bytes=(\d+)-(\d*)$/);
@@ -149,13 +151,8 @@ router.get("/proxy", async (req, res) => {
       let text = new TextDecoder().decode(Buffer.concat(chunks));
       const hostToken = new URL(url).searchParams.get("token");
       const hq = req.query.headers ? `&headers=${encodeURIComponent(req.query.headers)}` : "";
-      const wrap = (ref) => {
-        let abs = new URL(ref, r.url || url).href;
-        if (hostToken && !abs.includes("token=")) {
-          abs += (abs.includes("?") ? "&" : "?") + "token=" + hostToken;
-        }
-        return `/api/proxy?url=${encodeURIComponent(abs)}${hq}`;
-      };
+      const wrap = (ref) =>
+        `/api/proxy?url=${encodeURIComponent(childUrl(ref, r.url || url, hostToken))}${hq}`;
       text = text
         .replace(/^(?!#)(\S+)$/gm, (line) => wrap(line))
         .replace(/URI="([^"]+)"/g, (_m, ref) => `URI="${wrap(ref)}"`);

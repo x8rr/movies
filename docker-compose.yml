@@ -3,8 +3,21 @@ services:
     build: .
     ports:
       - "3000:3000"
+    # TMDB_API_KEY plus optional provider key overrides (see .env.example).
+    # Keep anything else out of this file: the container runs third-party JS (see README).
+    env_file: .env
     environment:
-      - CRYPTO_SECRET=${CRYPTO_SECRET}
-    volumes:
-      - ./data:/app/data
+      - PORT=3000
+      - HOST=0.0.0.0
+    # contain what that JS can do if it escapes node:vm
+    user: bun
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 2g
+    pids_limit: 256
     restart: unless-stopped

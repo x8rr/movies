@@ -13,5 +13,8 @@
     "cors": "^2.8.5",
     "express": "^5.1.0",
     "happy-dom": "^21.0.1"
+  },
+  "patchedDependencies": {
+    "@p-stream/providers@github:movie-web-rip/pstream-providers#8f8a949": "patches/@p-stream%2Fproviders@3.2.0.patch"
   }
 }

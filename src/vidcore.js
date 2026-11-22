@@ -1,8 +1,8 @@
 import vm from "node:vm";
 import { Window } from "happy-dom";
 
-// vidcore.io (vidcore.net redirects here) and vidup.to are white-labels of the same
-// VidFast-style player. The server list and stream URLs come from POST
+// vidfast.vc, vidcore.io (vidcore.net redirects here) and vidup.to run the same
+// VidFast player. The server list and stream URLs come from POST
 // /<deploy-path>/<op>/<token> calls whose path, token and response decryption all
 // happen inside an obfuscated bytecode VM that lives in the player React component's
 // effects. Rather than chase per-deploy keys, we run the site's own player module in
@@ -12,13 +12,15 @@ import { Window } from "happy-dom";
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 const SERVER_TIMEOUT = 7000;
-const TOTAL_TIMEOUT = 25000;
+// whole extraction (page + chunks + sandbox + server loop); providers.js gives the
+// vidfast -> vidcore -> vidup chain 18s in total
+const TOTAL_TIMEOUT = 10000;
 
 const scriptCache = new Map(); // chunk URL -> Promise<vm.Script>
 
 function getScript(url) {
   if (!scriptCache.has(url)) {
-    const p = fetch(url, { headers: { "User-Agent": UA } })
+    const p = fetch(url, { headers: { "User-Agent": UA }, signal: AbortSignal.timeout(TOTAL_TIMEOUT) })
       .then((r) => {
         if (!r.ok) throw new Error("chunk " + r.status);
         return r.text();
@@ -47,10 +49,44 @@ function parsePage(html) {
   const modLine = lines.find((l) => l.startsWith(ref + ":I["));
   if (!modLine) throw new Error("no player module ref");
   const modId = JSON.parse(modLine.slice(modLine.indexOf(":") + 2))[0];
-  const chunks = [...new Set([...html.matchAll(/src="(\/_next\/static\/chunks\/[^"]+\.js)"/g)].map((m) => m[1]))].filter(
-    (c) => !/\/(webpack|main-app|polyfills)-/.test(c),
-  );
-  return { props, modId, chunks };
+  const srcs = [...new Set([...html.matchAll(/src="(\/_next\/static\/chunks\/[^"]+\.js)"/g)].map((m) => m[1]))];
+  const chunks = srcs.filter((c) => !/\/(webpack|main-app|polyfills)-/.test(c));
+  const runtime = srcs.find((c) => /\/webpack-/.test(c));
+  return { props, modId, chunks, runtime };
+}
+
+// vidfast.vc's page module is a next/dynamic switch over ~20 player builds
+// (`o[variantIndex]`), each loaded from its own async chunk set. Pull the chunk ids and
+// module id of each loader out of the module source.
+function playerVariants(src) {
+  if (!/variantIndex/.test(src)) return null;
+  const out = [...src.matchAll(/Promise\.all\(\[([^\]]*)\]\)\.then\(\w+\.bind\(\w+,(\d+)\)\)/g)].map((m) => ({
+    chunks: [...m[1].matchAll(/\.e\((\d+)\)/g)].map((c) => Number(c[1])),
+    mod: Number(m[2]),
+  }));
+  return out.length ? out : null;
+}
+
+const chunkNamers = new Map(); // webpack runtime URL -> Promise<(chunkId) => path>
+
+// The runtime's `__webpack_require__.u` maps an async chunk id to its file name.
+function chunkNamer(url) {
+  if (!chunkNamers.has(url)) {
+    const p = fetch(url, { headers: { "User-Agent": UA } })
+      .then((r) => {
+        if (!r.ok) throw new Error("runtime " + r.status);
+        return r.text();
+      })
+      .then((code) => {
+        const m = /\b(\w+)\.u=(\w+)=>(.+?),\1\.miniCssF=/.exec(code);
+        if (!m) throw new Error("chunk namer not found");
+        return vm.runInNewContext(`(${m[2]})=>${m[3]}`, {}, { timeout: 1000 });
+      });
+    p.catch(() => chunkNamers.delete(url));
+    chunkNamers.set(url, p);
+    if (chunkNamers.size > 6) chunkNamers.delete(chunkNamers.keys().next().value);
+  }
+  return chunkNamers.get(url);
 }
 
 function nativeLike(name) {
@@ -136,10 +172,13 @@ function makeFakeReact(win, onChange) {
   return { R, st };
 }
 
-async function runPlayer(base, path, isTV) {
-  const pageResp = await fetch(base + path, { headers: { "User-Agent": UA } });
+async function runPlayer(base, path) {
+  const deadline = Date.now() + TOTAL_TIMEOUT;
+  const pageResp = await fetch(base + path, { headers: { "User-Agent": UA }, signal: AbortSignal.timeout(TOTAL_TIMEOUT) });
   if (!pageResp.ok) throw new Error("page " + pageResp.status);
-  const { props, modId, chunks } = parsePage(await pageResp.text());
+  // entry domains may redirect to the site's current one; everything else is same-origin
+  base = new URL(pageResp.url).origin;
+  let { props, modId, chunks, runtime } = parsePage(await pageResp.text());
   const scripts = await Promise.all(chunks.map((c) => getScript(base + c)));
 
   const win = new Window({ url: base + path, width: 1280, height: 720 });
@@ -148,6 +187,8 @@ async function runPlayer(base, path, isTV) {
   let lastStreamToken = null; // last path segment of the most recently completed player API call
   const prefetched = new Map(); // stream call URL -> Promise<Response>
   const prefetchByData = new Map(); // server.data -> same promise
+  let streamPrefix = null; // stream op URL minus the server token, from the first stream call
+  let rateLimited = false;
   let getServers = () => null;
 
   const ctx = {};
@@ -260,25 +301,28 @@ async function runPlayer(base, path, isTV) {
       if (prefetched.has(url)) return fromCache();
       // First stream call for a known server: we now know the op path, so fire the
       // stream calls for every other server in parallel and serve them from cache.
+      // The player sometimes repeats the auto-selected server's call under another op
+      // path; that one goes out alone — the site 429s at a dozen-odd calls in a burst.
       const servers = getServers();
-      if (servers && servers.some((s) => s.data === token)) {
-        const prefix = url.slice(0, url.length - token.length);
+      if (servers && !streamPrefix && servers.some((s) => s.data === token)) {
+        streamPrefix = url.slice(0, url.length - token.length);
         for (const srv of servers) {
-          const u = prefix + srv.data;
-          if (!prefetched.has(u)) {
-            const p = fetch(u, { ...reqOpts, signal: AbortSignal.timeout(SERVER_TIMEOUT) }).then(async (r) => {
-              const body = await r.arrayBuffer();
-              return new Response(body, { status: r.status, headers: r.headers });
-            });
-            p.catch(() => {});
-            prefetched.set(u, p);
-            prefetchByData.set(srv.data, p);
-          }
+          const u = streamPrefix + srv.data;
+          const p = fetch(u, { ...reqOpts, signal: AbortSignal.timeout(SERVER_TIMEOUT) }).then(async (r) => {
+            const body = await r.arrayBuffer();
+            return new Response(body, { status: r.status, headers: r.headers });
+          });
+          p.catch(() => {});
+          prefetched.set(u, p);
+          prefetchByData.set(srv.data, p);
         }
         return fromCache();
       }
       return fetch(url, { ...reqOpts, signal: AbortSignal.timeout(SERVER_TIMEOUT) })
-        .then(done)
+        .then((r) => {
+          if (r.status === 429 && !servers) rateLimited = true;
+          return done(r);
+        })
         .catch(() => new Response("", { status: 504 }));
     },
     webpackChunk_N_E: [],
@@ -301,14 +345,36 @@ async function runPlayer(base, path, isTV) {
 
   try {
     const vmCtx = vm.createContext(ctx);
-    for (const s of scripts) {
-      try {
-        s.runInContext(vmCtx, { timeout: 15000 });
-      } catch {}
-    }
+    const runAll = (list) => {
+      for (const s of list) {
+        try {
+          s.runInContext(vmCtx, { timeout: 15000 });
+        } catch {}
+      }
+    };
+    runAll(scripts);
     const modules = {};
-    for (const entry of ctx.webpackChunk_N_E) Object.assign(modules, entry[1]);
+    const collect = () => {
+      for (const entry of ctx.webpackChunk_N_E) Object.assign(modules, entry[1]);
+    };
+    collect();
     if (!modules[modId]) throw new Error("player module missing");
+
+    const variants = playerVariants(modules[modId].toString());
+    if (variants) {
+      if (!runtime) throw new Error("no webpack runtime");
+      const { variantIndex, ...rest } = props;
+      const v = variants[variantIndex] || variants[0];
+      const name = await chunkNamer(base + runtime);
+      const paths = v.chunks.map((id) => "/_next/" + name(id)).filter((p) => !/undefined/.test(p) && !chunks.includes(p));
+      // css-only chunk ids have no js file; a missing one just means a missing module below
+      const extra = await Promise.allSettled(paths.map((p) => getScript(base + p)));
+      runAll(extra.filter((r) => r.status === "fulfilled").map((r) => r.value));
+      collect();
+      if (!modules[v.mod]) throw new Error("player variant module missing");
+      modId = v.mod;
+      props = rest;
+    }
 
     let scheduled = false;
     let renders = 0;
@@ -384,16 +450,15 @@ async function runPlayer(base, path, isTV) {
         tick();
       });
 
-    const deadline = Date.now() + TOTAL_TIMEOUT;
     render();
 
     // server list = the state hook holding [{ name, data, ... }]
     const serversHook = () =>
       st.hooks.find((h) => h?.state && Array.isArray(h.v) && h.v.length && h.v.every((s) => s && s.name && s.data));
     getServers = () => serversHook()?.v || null;
-    await wait(15000, () => serversHook());
+    await wait(deadline - Date.now(), () => rateLimited || serversHook());
     const sh = serversHook();
-    if (!sh) return [];
+    if (!sh) throw new Error(rateLimited ? "rate limited (429)" : "no server list");
 
     // The decrypted source ends up in a hook as { url, tracks, noReferrer, mp4, ... }.
     // Attribute each new one to the server whose `data` token was in the last API call.
@@ -430,14 +495,14 @@ async function runPlayer(base, path, isTV) {
         await wait(Math.min(pre ? 3500 : SERVER_TIMEOUT, deadline - Date.now()), () => byServer.has(name));
         // the sandboxed player can't actually play, so it soon marks the selected server
         // failed; let that settle so it doesn't land on the next server we select.
-        await wait(1500, () => sh.v.every((s) => s.failed || !s.selected));
+        await wait(Math.min(1500, deadline - Date.now()), () => sh.v.every((s) => s.failed || !s.selected));
       }
       harvest();
     } finally {
       clearInterval(poller);
     }
-    const results = sh.v.map((s) => byServer.get(s.name)).filter(Boolean);
-    return results;
+    const found = sh.v.map((s) => byServer.get(s.name)).filter(Boolean);
+    return { base, found };
   } finally {
     teardown();
   }
@@ -448,7 +513,7 @@ async function alive(s) {
   try {
     const r = await fetch(s.url, {
       headers: { "User-Agent": UA, ...(s.headers || {}), ...(s.type === "file" ? { Range: "bytes=0-1023" } : {}) },
-      signal: AbortSignal.timeout(6000),
+      signal: AbortSignal.timeout(4000),
     });
     if (s.type === "hls") return r.ok && (await r.text()).trimStart().startsWith("#EXTM3U");
     r.body?.cancel();
@@ -458,11 +523,20 @@ async function alive(s) {
   }
 }
 
+// After a 429 the site is skipped for a while: retrying only extends the ban, and the
+// caller's fallback chain moves on to the next white-label domain immediately.
+const RATE_LIMIT_COOLDOWN = 60 * 1000;
+const coolingUntil = new Map(); // base -> timestamp
+
 export async function vidfastFamilyExtract({ base, id, name }, type, tmdbId, season, episode) {
   try {
+    if (Date.now() < (coolingUntil.get(base) || 0)) return [];
     const isTV = type !== "movie";
     const path = isTV ? `/tv/${tmdbId}/${season}/${episode}` : `/movie/${tmdbId}`;
-    const found = await runPlayer(base, path, isTV);
+    const { base: origin, found } = await runPlayer(base, path).catch((e) => {
+      if (/\b429\b/.test(e.message)) coolingUntil.set(base, Date.now() + RATE_LIMIT_COOLDOWN);
+      throw e;
+    });
     const seen = new Set();
     const streams = [];
     for (const { name: server, description, obj } of found) {
@@ -476,7 +550,7 @@ export async function vidfastFamilyExtract({ base, id, name }, type, tmdbId, sea
         providerName: `${name} ${server}`,
       };
       if (/4k/i.test(description || "")) s.quality = "2160p";
-      if (!obj.noReferrer) s.headers = { Referer: base + "/", Origin: base };
+      if (!obj.noReferrer) s.headers = { Referer: origin + "/", Origin: origin };
       streams.push(s);
     }
     const ok = await Promise.all(streams.map(alive));

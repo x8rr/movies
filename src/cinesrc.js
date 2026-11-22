@@ -73,11 +73,11 @@ async function discoverConfig() {
 
   let assetConfig = null;
   let providerListActionId = null;
-  let getStreamActionId = null;
+  let streamUrlActionId = null;
+  let streamPath = null;
 
-  for (const chunkUrl of chunkUrls) {
-    const code = await fetchScript(chunkUrl);
-
+  const codes = await Promise.all(chunkUrls.map((c) => fetchScript(c)));
+  for (const code of codes) {
     if (!assetConfig) {
       const m = code.match(/assets:\{client:"([^"]+)",worker:"([^"]+)",wasm:"([^"]+)"\}/);
       if (m) assetConfig = { client: m[1], worker: m[2], wasm: m[3] };
@@ -87,18 +87,24 @@ async function discoverConfig() {
       const m = code.match(/createServerReference\)\("([a-f0-9]+)"[^)]*?"getProviderList"\)/);
       if (m) providerListActionId = m[1];
     }
-    if (!getStreamActionId) {
-      const m = code.match(/createServerReference\)\("([a-f0-9]+)"[^)]*?"getStream"\)/);
-      if (m) getStreamActionId = m[1];
+    // resolves sources that come back as { hash } instead of { url }
+    if (!streamUrlActionId) {
+      const m = code.match(/createServerReference\)\("([a-f0-9]+)"[^)]*?"getStreamUrl"\)/);
+      if (m) streamUrlActionId = m[1];
+    }
+    // the stream endpoint lives at a randomized /api/<slug> path that changes per deploy
+    if (!streamPath) {
+      const m = code.match(/fetch\("(\/api\/[A-Za-z0-9_-]+)",\{method:"POST"[^}]*\},body:JSON\.stringify\(\{id:\w+,type:/);
+      if (m) streamPath = m[1];
     }
 
-    if (assetConfig && providerListActionId && getStreamActionId) break;
+    if (assetConfig && providerListActionId && streamUrlActionId && streamPath) break;
   }
 
   if (!assetConfig) throw new Error("could not discover asset config");
-  if (!providerListActionId || !getStreamActionId) throw new Error("could not discover action IDs");
+  if (!providerListActionId || !streamPath) throw new Error("could not discover stream endpoints");
 
-  _siteConfig = { assets: assetConfig, providerListActionId, getStreamActionId };
+  _siteConfig = { assets: assetConfig, providerListActionId, streamUrlActionId, streamPath };
   _configExpiry = Date.now() + 3600_000;
   scriptCache.clear();
   return _siteConfig;
@@ -546,73 +552,80 @@ export async function cinesrcExtract(type, tmdbId, season, episode) {
     const searchStr = isTV ? `?s=${season}&e=${episode}` : "";
     const fullPath = embedPath + searchStr;
 
-    const { r: rToken, p: pToken, _cookies: cookies } = await callBootstrap(encoded);
-
-    const { token: challenge, decrypt } = await solveChallenge(
-      config, encoded, rToken, pToken, embedPath, searchStr, cookies,
-    );
-
-    const providers = await callAction(
-      config.providerListActionId,
-      [],
-      fullPath,
-      {},
-      cookies,
-    );
-
+    const boot = await callBootstrap(encoded);
+    const providers = await callAction(config.providerListActionId, [], fullPath, {}, boot._cookies);
     if (!Array.isArray(providers) || !providers.length) return [];
 
+    // top-ranked servers, each one a separate mirror
     const top = providers
+      .filter((p) => p.rank == null || p.rank >= 0)
       .sort((a, b) => (b.rank || 0) - (a.rank || 0))
-      .slice(0, 1);
+      .slice(0, 3);
 
-    const results = [];
-    for (const prov of top) {
+    // each server needs its own challenge solve (~2s); run them side by side so the
+    // provider answers inside the scrape's grace window
+    const perServer = await Promise.all(top.map(async (prov, i) => {
+      const results = [];
       try {
-        const args = isTV
-          ? [String(tmdbId), "show", String(season), String(episode), challenge, prov.id]
-          : [String(tmdbId), "movie", undefined, undefined, challenge, prov.id];
-
-        const raw = await callAction(
-          config.getStreamActionId,
-          args,
-          fullPath,
-          { "x-cs-r": rToken, "x-cs-q": encoded, "x-cs-p": pToken },
+        // challenge tokens are single-use, so every attempt needs a fresh bootstrap + solve
+        const { r: rToken, p: pToken, _cookies: cookies } = i === 0 ? boot : await callBootstrap(encoded);
+        const { token: challenge, decrypt } = await solveChallenge(
+          config, encoded, rToken, pToken, embedPath, searchStr, cookies,
+        );
+        const resp = await fetchWithCookies(
+          config.streamPath,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Referer: BASE + fullPath, Origin: BASE },
+            body: JSON.stringify({
+              id: String(tmdbId),
+              type: isTV ? "show" : "movie",
+              season: isTV ? String(season) : undefined,
+              episode: isTV ? String(episode) : undefined,
+              challenge,
+              provider: prov.id,
+            }),
+          },
           cookies,
         );
+        if (!resp.ok) throw new Error("stream " + resp.status);
+        const raw = await resp.text();
+        if (!raw || raw.startsWith("e1:")) return results;
 
-        if (!raw || raw === "e1:invalid_challenge") continue;
+        let data = null;
+        try {
+          data = decrypt ? await decrypt(raw) : JSON.parse(raw);
+        } catch {}
 
-        let data;
-        if (decrypt) {
-          try { data = await decrypt(raw); } catch {
-            data = typeof raw === "object" ? raw : null;
-          }
-        } else {
-          data = typeof raw === "object" ? raw : null;
-        }
-
-        if (!data?.url) continue;
+        if (!data?.url) return results;
 
         const urls = Array.isArray(data.url) ? data.url : [data.url];
         for (const u of urls) {
-          let streamUrl = typeof u === "string" ? u : u?.url || u?.source;
+          let streamUrl = typeof u === "string" ? u : u?.url;
+          if (!streamUrl && u?.hash && config.streamUrlActionId) {
+            const r = await callAction(config.streamUrlActionId, [u.hash], fullPath, {}, cookies).catch(() => null);
+            streamUrl = r?.url;
+          }
           if (!streamUrl) continue;
           if (streamUrl.startsWith("/")) streamUrl = BASE + streamUrl;
+          const hls = u?.format === "hls" || /m3u8/i.test(streamUrl);
           results.push({
             url: streamUrl,
-            type: streamUrl.includes(".m3u8") ? "hls" : "file",
+            type: hls ? "hls" : "file",
             quality: u?.height ? `${u.height}p` : u?.quality || undefined,
             provider: "cinesrc",
             providerName: "CineSrc " + prov.name.replace(/[^\w\s]/g, "").trim(),
+            // mirror hosts answer 404 unless the request comes from the cinesrc player
+            headers: { Referer: BASE + "/", Origin: BASE },
           });
         }
       } catch (e) {
         console.log(`[cinesrc] ${prov.id}:`, e.message);
       }
-    }
+      return results;
+    }));
 
-    return results;
+    return perServer.flat();
   } catch (e) {
     console.log("[cinesrc] error:", e.stack || e.message);
     return [];

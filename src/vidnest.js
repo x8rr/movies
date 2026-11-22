@@ -154,23 +154,6 @@ const HANDLERS = {
       .map((s) => mk("delta", s.url, { type: s.type, headers: pickHeaders(s.headers), label: s.language })),
 };
 
-// Several vidnest servers intermittently hand back dead/Cloudflare-blocked or embed-page
-// URLs, so probe each candidate (in parallel) and keep only ones that actually serve media.
-async function alive(s) {
-  if (/\/embed[./]/.test(s.url)) return false;
-  try {
-    const r = await fetch(s.url, {
-      headers: { "User-Agent": UA, Referer: new URL(s.url).origin + "/", ...(s.headers || {}), Range: "bytes=0-1023" },
-      signal: AbortSignal.timeout(6000),
-    });
-    if (s.type === "hls") return r.ok && (await r.text()).trimStart().startsWith("#EXTM3U");
-    r.body?.cancel();
-    return r.status === 200 || r.status === 206;
-  } catch {
-    return false;
-  }
-}
-
 export async function vidnestExtract(type, tmdbId, season, episode) {
   try {
     const isTV = type !== "movie";
@@ -183,9 +166,8 @@ export async function vidnestExtract(type, tmdbId, season, episode) {
         return [];
       }
     });
-    const streams = (await Promise.all(jobs)).flat();
-    const ok = await Promise.all(streams.map(alive));
-    return streams.filter((_, i) => ok[i]);
+    // some servers hand back embed-page URLs; the shared liveness check drops the other duds
+    return (await Promise.all(jobs)).flat().filter((s) => !/\/embed[./]/.test(s.url));
   } catch (e) {
     console.log("[vidnest] error:", e.message);
     return [];

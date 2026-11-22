@@ -69,18 +69,15 @@ async function getServer(path, server) {
     let data = await r.json();
     if (data && typeof data.c === "string" && !data.url) data = await decrypt(data.c);
     if (!data?.url) return null;
+    // CDNs behind vidzee (ngcloud, vercetti, ...) 403 anything not coming from the player
     const headers =
-      data.headers && Object.keys(data.headers).length
-        ? data.headers
-        : /fastcloud|vercetti|nexcloud/.test(data.url)
-          ? { Referer: PLAYER + "/", Origin: PLAYER }
-          : undefined;
+      data.headers && Object.keys(data.headers).length ? data.headers : { Referer: PLAYER + "/", Origin: PLAYER };
     return {
       url: data.url,
       type: /\.(mp4|mkv|webm)(\?|$)/i.test(data.url) ? "file" : "hls",
       provider: "vidzee",
       providerName: "VidZee " + server.label,
-      ...(headers ? { headers } : {}),
+      headers,
     };
   } catch {
     return null;

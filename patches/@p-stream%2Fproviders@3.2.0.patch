@@ -1,0 +1,266 @@
+diff --git a/src/providers/embeds/streamwish.ts b/src/providers/embeds/streamwish.ts
+index 352e459..27073cd 100644
+--- a/src/providers/embeds/streamwish.ts
++++ b/src/providers/embeds/streamwish.ts
+@@ -144,28 +144,11 @@ function embed(provider: { id: string; name: string; rank: number; disabled?: bo
+           'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36',
+       };
+ 
+-      const domains = [
+-        'hgplaycdn.com',
+-        'habetar.com',
+-        'yuguaab.com',
+-        'guxhag.com',
+-        'auvexiug.com',
+-        'xenolyzb.com',
+-        'tryzendm.com',
+-      ];
+-      ctx.url = `https://${domains[Math.floor(Math.random() * domains.length)]}${ctx.url.replace('https://streamwish.to', '')}`;
+-
+-      let html: string;
+-      try {
+-        html = await ctx.proxiedFetcher<string>(ctx.url, { headers });
+-      } catch (error) {
+-        console.error(`Error:`, {
+-          message: error instanceof Error ? error.message : 'Unknown error',
+-          cause: (error as any).cause || undefined,
+-          url: ctx.url,
+-        });
+-        throw error;
+-      }
++      // streamwish.to itself only serves an obfuscated JS redirector; hgplaycdn.com is the mirror still serving
++      // the packed player (habetar/yuguaab/guxhag/auvexiug/xenolyzb/tryzendm no longer resolve).
++      ctx.url = `https://hgplaycdn.com${new URL(ctx.url).pathname}`;
++
++      const html = await ctx.proxiedFetcher<string>(ctx.url, { headers });
+       const obfuscatedScript = html.match(/<script[^>]*>\s*(eval\(function\(p,a,c,k,e,d.*?\)[\s\S]*?)<\/script>/);
+ 
+       if (!obfuscatedScript) {
+diff --git a/src/providers/sources/cuevana3.ts b/src/providers/sources/cuevana3.ts
+index 87adbb1..433d3a8 100644
+--- a/src/providers/sources/cuevana3.ts
++++ b/src/providers/sources/cuevana3.ts
+@@ -56,43 +56,45 @@ function validateStream(url: string): boolean {
+ }
+ 
+ async function extractVideos(ctx: MovieScrapeContext | ShowScrapeContext, videos: VideosByLanguage) {
+-  const videoList: { embedId: string; url: string }[] = [];
++  // resolve every player.php in parallel; sequentially a movie with ~10 mirrors blew the time budget
++  const entries = Object.entries(videos).flatMap(([lang, videoArray]) =>
++    (videoArray ?? []).filter((video) => video.result).map((video) => ({ lang, result: video.result })),
++  );
++  const resolved = await Promise.all(
++    entries.map(async ({ lang, result }) => ({ lang, realUrl: await getStreamUrl(ctx, result) })),
++  );
+ 
+-  for (const [lang, videoArray] of Object.entries(videos)) {
+-    if (!videoArray) continue;
+-
+-    for (const video of videoArray) {
+-      if (!video.result) continue;
+-
+-      const realUrl = await getStreamUrl(ctx, video.result);
+-      if (!realUrl || !validateStream(realUrl)) continue;
+-
+-      let embedId = '';
+-      if (realUrl.includes('filemoon')) embedId = 'filemoon';
+-      else if (realUrl.includes('streamwish')) {
+-        if (lang === 'latino') embedId = 'streamwish-latino';
+-        else if (lang === 'spanish') embedId = 'streamwish-spanish';
+-        else if (lang === 'english') embedId = 'streamwish-english';
+-        else embedId = 'streamwish-latino';
+-      } else if (realUrl.includes('vidhide')) embedId = 'vidhide';
+-      else if (realUrl.includes('voe')) embedId = 'voe';
+-      else continue;
+-
+-      videoList.push({
+-        embedId,
+-        url: realUrl,
+-      });
+-    }
++  const videoList: { embedId: string; url: string }[] = [];
++  for (const { lang, realUrl } of resolved) {
++    if (!realUrl || !validateStream(realUrl)) continue;
++
++    let embedId = '';
++    if (realUrl.includes('filemoon')) embedId = 'filemoon';
++    else if (realUrl.includes('streamwish')) {
++      if (lang === 'latino') embedId = 'streamwish-latino';
++      else if (lang === 'spanish') embedId = 'streamwish-spanish';
++      else if (lang === 'english') embedId = 'streamwish-english';
++      else embedId = 'streamwish-latino';
++    } else if (realUrl.includes('vidhide')) embedId = 'vidhide';
++    else if (realUrl.includes('voe')) embedId = 'voe';
++    else continue;
++
++    videoList.push({
++      embedId,
++      url: realUrl,
++    });
+   }
+ 
+   return videoList;
+ }
+ 
++// cuevana3 is a Latin-American site: its slugs follow the es-MX title ("El club de la pelea"), not es-ES
++// ("El club de la lucha", which 500s)
+ async function fetchTmdbTitleInSpanish(tmdbId: number, apiKey: string, mediaType: 'movie' | 'show'): Promise<string> {
+   const endpoint =
+     mediaType === 'movie'
+-      ? `https://api.themoviedb.org/3/movie/${tmdbId}?api_key=${apiKey}&language=es-ES`
+-      : `https://api.themoviedb.org/3/tv/${tmdbId}?api_key=${apiKey}&language=es-ES`;
++      ? `https://api.themoviedb.org/3/movie/${tmdbId}?api_key=${apiKey}&language=es-MX`
++      : `https://api.themoviedb.org/3/tv/${tmdbId}?api_key=${apiKey}&language=es-MX`;
+ 
+   const response = await fetch(endpoint);
+   if (!response.ok) {
+diff --git a/src/providers/sources/fsharetv.ts b/src/providers/sources/fsharetv.ts
+index 8d8a2ea..5a774c2 100644
+--- a/src/providers/sources/fsharetv.ts
++++ b/src/providers/sources/fsharetv.ts
+@@ -32,11 +32,17 @@ async function comboScraper(ctx: ShowScrapeContext | MovieScrapeContext): Promis
+     searchResults.push({ title, year: Number(year) ?? undefined, url });
+   });
+ 
+-  const watchPageUrl = searchResults.find((x) => x && compareMedia(ctx.media, x.title, x.year))?.url;
++  // result urls embed the IMDb id (/movie/<slug>-tt0137523); prefer that over fuzzy title matching
++  const imdbId = ctx.media.imdbId;
++  const watchPageUrl = (
++    (imdbId && searchResults.find((x) => x.url.endsWith(`-${imdbId}`))) ||
++    searchResults.find((x) => x && compareMedia(ctx.media, x.title, x.year))
++  )?.url;
+   if (!watchPageUrl) throw new NotFoundError('No watchable item found');
+   ctx.progress(50);
+ 
+-  const watchPage = await ctx.proxiedFetcher(watchPageUrl.replace('/movie', '/w'), { baseUrl });
++  // the /w/ watch page sits behind a Cloudflare challenge; the /movie/ page carries the same setSource() call
++  const watchPage = await ctx.proxiedFetcher(watchPageUrl, { baseUrl });
+ 
+   const fileId = watchPage.match(/Movie\.setSource\('([^']*)'/)?.[1];
+   if (!fileId) throw new Error('File ID not found');
+@@ -52,17 +58,15 @@ async function comboScraper(ctx: ShowScrapeContext | MovieScrapeContext): Promis
+   );
+   if (!apiRes.data.file.sources.length) throw new Error('No sources found');
+ 
+-  // this is to get around a ext bug where it doesn't send the headers to the second req after redir
+-  const mediaBase = new URL((await ctx.proxiedFetcher.full(apiRes.data.file.sources[0].src, { baseUrl })).finalUrl)
+-    .origin;
+-
++  // /api/media/* 302-redirects to a rotating CDN host (vhcdn.sbs, megacdn.icu, ...) that requires an
++  // fsharetv Referer; hand out the stable fsharetv.co url and let the player/proxy follow the redirect.
+   const qualities = apiRes.data.file.sources.reduce(
+     (acc, source) => {
+       const quality = typeof source.quality === 'number' ? source.quality.toString() : source.quality;
+       const validQuality = getValidQualityFromString(quality);
+       acc[validQuality] = {
+         type: 'mp4',
+-        url: `${mediaBase}${source.src.replace('/api', '')}`,
++        url: new URL(source.src, baseUrl).href,
+       };
+       return acc;
+     },
+@@ -78,7 +82,7 @@ async function comboScraper(ctx: ShowScrapeContext | MovieScrapeContext): Promis
+         type: 'file',
+         flags: [],
+         headers: {
+-          referer: 'https://fsharetv.co',
++          referer: 'https://fsharetv.co/',
+         },
+         qualities,
+         captions: [],
+diff --git a/src/providers/sources/hdrezka/index.ts b/src/providers/sources/hdrezka/index.ts
+index facc8a5..fbbf0eb 100644
+--- a/src/providers/sources/hdrezka/index.ts
++++ b/src/providers/sources/hdrezka/index.ts
+@@ -119,38 +119,14 @@ async function getStream(
+   }
+ }
+ 
+-async function getTranslatorId(
+-  url: string,
+-  id: string,
+-  ctx: ShowScrapeContext | MovieScrapeContext,
+-): Promise<string | null> {
+-  // console.log('Getting translator ID for:', { url, id });
+-
+-  const response = await ctx.proxiedFetcher<string>(url, {
+-    headers: baseHeaders,
+-  });
+-
+-  // Translator ID 238 represents the Original + subtitles player.
+-  if (response.includes(`data-translator_id="238"`)) {
+-    // console.log('Found translator ID 238');
+-    return '238';
+-  }
+-
+-  const functionName = ctx.media.type === 'movie' ? 'initCDNMoviesEvents' : 'initCDNSeriesEvents';
+-  const regexPattern = new RegExp(`sof\\.tv\\.${functionName}\\(${id}, ([^,]+)`, 'i');
+-  const match = response.match(regexPattern);
+-  const translatorId = match ? match[1] : null;
+-
+-  // console.log('Found translator ID:', translatorId);
+-  return translatorId;
+-}
+-
+ const universalScraper = async (ctx: ShowScrapeContext | MovieScrapeContext): Promise<SourcererOutput> => {
+   const result = await searchAndFindMediaId(ctx);
+   if (!result || !result.id) throw new NotFoundError('No result found');
+ 
+-  const translatorId = await getTranslatorId(result.url, result.id, ctx);
+-  if (!translatorId) throw new NotFoundError('No translator id found');
++  // Title pages now sit behind an Anubis proof-of-work wall (redirect to hdrezka-home.tv), but the CDN ajax
++  // endpoint still answers with the RU app headers. Request translator 238 ("Оригинал (+субтитры)",
++  // the original-language audio) directly; titles without an original track have only Russian dubs.
++  const translatorId = '238';
+ 
+   const { url: streamUrl, subtitle: streamSubtitle } = await getStream(result.id, translatorId, ctx);
+   const parsedVideos = parseVideoLinks(streamUrl);
+diff --git a/src/providers/sources/hdrezka/utils.ts b/src/providers/sources/hdrezka/utils.ts
+index ad2307d..e843a2d 100644
+--- a/src/providers/sources/hdrezka/utils.ts
++++ b/src/providers/sources/hdrezka/utils.ts
+@@ -93,15 +93,12 @@ function parseVideoLinks(inputString?: string): FileBasedStream['qualities'] {
+       if (match) {
+         // eslint-disable-next-line @typescript-eslint/no-unused-vars
+         const [_, quality, url] = match;
+-        // Skip premium qualities that are null
+-        if (url === 'null') return;
+-
+-        // Normalize quality (remove HTML tags and convert to lowercase)
+-        const normalizedQuality = quality
+-          .replace(/<[^>]+>/g, '') // Remove HTML tags
+-          .toLowerCase()
+-          .replace('p', '')
+-          .trim();
++        // Skip premium qualities that are null, and premium tiers (2K/4K) that just repeat the 1080p Ultra url
++        if (url === 'null' || Object.values(qualityMap).some((q) => q.url === url.trim())) return;
++
++        // Normalize quality: strip HTML tags and keep the resolution ("1080p Ultra" -> "1080")
++        const label = quality.replace(/<[^>]+>/g, '').toLowerCase();
++        const normalizedQuality = (label.match(/\d{3,4}(?=p)|4k/)?.[0] ?? label.replace('p', '')).trim();
+ 
+         qualityMap[normalizedQuality] = {
+           type: 'mp4',
+diff --git a/src/providers/sources/lookmovie/video.ts b/src/providers/sources/lookmovie/video.ts
+index c208577..2ea80b2 100644
+--- a/src/providers/sources/lookmovie/video.ts
++++ b/src/providers/sources/lookmovie/video.ts
+@@ -14,7 +14,8 @@ export async function getVideoSources(
+ 
+   let path = '';
+   if (media.type === 'show') {
+-    path = `/v1/episodes/view`;
++    // v1/episodes/view now answers 401 Unauthorized; v2 serves the same payload unauthenticated
++    path = `/v2/episodes/view`;
+   } else if (media.type === 'movie') {
+     path = `/v1/movies/view`;
+   }
+@@ -32,7 +33,7 @@ export async function getVideo(
+ ): Promise<{ playlist: string | null; captions: Caption[] }> {
+   // Get sources
+   const data = await getVideoSources(ctx, id, media);
+-  const videoSources = data.streams;
++  const videoSources = data.streams ?? {};
+ 
+   // Find video URL and return it
+   const opts = ['auto', '1080p', '1080', '720p', '720', '480p', '480', '240p', '240', '360p', '360', '144', '144p'];

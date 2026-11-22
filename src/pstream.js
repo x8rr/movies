@@ -11,13 +11,47 @@ const providers = makeProviders({
   consistentIpForRequests: true,
 });
 
-const EMBED_TIMEOUT = 10000;
+// Sources whose backends are gone; skipping them saves a wasted request burst per lookup.
+const EXCLUDED = new Map([
+  ["mbp-api", "mbp-api.ruixinhong20.workers.dev answers 500 Internal Server Error to every search/details call"],
+  ["turbovidSource", "turbovid.eu no longer resolves (NXDOMAIN)"],
+  ["rgshows", "api.rgshows.ru is a for-sale page; api.rgshows.me is a parked domain (parklogic redirector)"],
+  ["tugaflix", "tugaflix.love is a parked domain (parklogic redirector)"],
+  ["wecima", "wecima.tube is a parked domain (parklogic redirector)"],
+  ["primewire", "primesrc.me /api/v1/l link lookup requires a Cloudflare Turnstile token (403 cf-mitigated)"],
+  ["pelisplushd", "ww3.pelisplus.to serves a self-signed example.com certificate and drops connections"],
+  ["zunime", "backend.xaiby.sbs is a parked domain"],
+  ["animetsu", "backend.animetsu.to is a parked domain; animetsu.cc no longer resolves"],
+]);
 
-function timeout(promise, ms) {
-  return Promise.race([
-    promise,
-    new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), ms)),
-  ]);
+// Per-embed cap, and how long to keep waiting for slower mirrors once one embed has produced streams
+// (some streamwish CDN nodes accept the connection and never answer, which would stall the whole source).
+const EMBED_TIMEOUT = 10000;
+const EMBED_GRACE = 1500;
+
+function collectEmbeds(tasks) {
+  return new Promise((resolve) => {
+    const out = [];
+    let pending = tasks.length;
+    let grace = null;
+    const done = () => {
+      clearTimeout(cap);
+      clearTimeout(grace);
+      resolve(out.slice());
+    };
+    const cap = setTimeout(done, EMBED_TIMEOUT);
+    for (const task of tasks) {
+      task
+        .then((streams) => {
+          out.push(...streams);
+          if (streams.length && !grace) grace = setTimeout(done, EMBED_GRACE);
+        })
+        .catch(() => {})
+        .finally(() => {
+          if (--pending === 0) done();
+        });
+    }
+  });
 }
 
 async function buildMedia(type, tmdbId, season, episode) {
@@ -74,16 +108,17 @@ async function runSource(source, media) {
   if (streams.length || !out.embeds?.length) return streams;
 
   const embedNames = new Map(providers.listEmbeds().map((e) => [e.id, e.name]));
-  const results = await Promise.allSettled(
+  return collectEmbeds(
     out.embeds.map((e) =>
-      timeout(providers.runEmbedScraper({ id: e.embedId, url: e.url }), EMBED_TIMEOUT).then((r) =>
-        (r.stream || []).flatMap((s) =>
-          convert(s, source.id, `${source.name} ${embedNames.get(e.embedId) || e.embedId}`),
+      providers
+        .runEmbedScraper({ id: e.embedId, url: e.url })
+        .then((r) =>
+          (r.stream || []).flatMap((s) =>
+            convert(s, source.id, `${source.name} ${embedNames.get(e.embedId) || e.embedId}`),
+          ),
         ),
-      ),
     ),
   );
-  return results.flatMap((r) => (r.status === "fulfilled" ? r.value : []));
 }
 
 export function pstreamTasks(type) {
@@ -91,7 +126,7 @@ export function pstreamTasks(type) {
   let mediaP = null;
   return providers
     .listSources()
-    .filter((s) => s.mediaTypes?.includes(mediaType))
+    .filter((s) => s.mediaTypes?.includes(mediaType) && !EXCLUDED.has(s.id))
     .map((s) => ({
       id: s.id,
       name: s.name,
@@ -107,5 +142,8 @@ export function pstreamTasks(type) {
 }
 
 export function listPstream() {
-  return { sources: providers.listSources(), embeds: providers.listEmbeds() };
+  return {
+    sources: providers.listSources().filter((s) => !EXCLUDED.has(s.id)),
+    embeds: providers.listEmbeds(),
+  };
 }
